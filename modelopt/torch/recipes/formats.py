@@ -93,6 +93,42 @@ KV_FORMAT_REGISTRY: dict[str, dict[str, Any]] = {
         },
         "default": {"enable": False},
     },
+    "fp8_affine": {
+        "*[kv]_bmm_quantizer": {
+            "num_bits": (4, 3),
+            "axis": None,
+            "enable": True,
+            "bias": {-2: None, -4: None, "type": "static"},
+        },
+        "default": {"enable": False},
+    },
+    "nvfp4_affine": {
+        "*[kv]_bmm_quantizer": {
+            "num_bits": (2, 1),
+            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            "axis": None,
+            "enable": True,
+            "bias": {-2: None, -4: None, "type": "static"},
+        },
+        "default": {"enable": False},
+    },
+    "nvfp4_rotate": {
+        "*q_bmm_quantizer": {"enable": False, "rotate": True},
+        "*k_bmm_quantizer": {
+            "num_bits": (2, 1),
+            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            "axis": None,
+            "enable": True,
+            "rotate": True,
+        },
+        "*v_bmm_quantizer": {
+            "num_bits": (2, 1),
+            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            "axis": None,
+            "enable": True,
+        },
+        "default": {"enable": False},
+    },
 }
 
 
