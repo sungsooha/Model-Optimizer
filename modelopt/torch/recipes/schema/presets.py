@@ -141,7 +141,9 @@ def _normalize_yaml_config(config: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
-def _load_recipe_from_yaml(recipe_dir: str, recipes_root: Path) -> dict[str, Any]:  # pragma: no cover
+def _load_recipe_from_yaml(
+    recipe_dir: str, recipes_root: Path
+) -> dict[str, Any]:  # pragma: no cover
     """Load a composed recipe directory into a preset config dict.
 
     A recipe directory contains:
