@@ -180,20 +180,22 @@ def plan_pipeline(recipe: RecipeConfig, recipe_path: str = "<inline>") -> Pipeli
     return plan
 
 
+def _section_to_config(
+    section,
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+    """Extract config, calibration, and training from a section via model_dump.
+
+    Preserves all fields including extra technique-specific options.
+    """
+    raw = section.model_dump(exclude_none=True)
+    calib = raw.pop("calibration", None)
+    training = raw.pop("training", None)
+    return raw, calib, training
+
+
 def _plan_pruning(section) -> PipelineStep:
     """Resolve pruning section to a pipeline step."""
-    config = {
-        "mode": section.mode,
-        "constraints": section.constraints,
-    }
-
-    calib = None
-    if section.calibration:
-        calib = section.calibration.model_dump()
-
-    training = None
-    if section.training:
-        training = section.training.model_dump()
+    config, calib, training = _section_to_config(section)
 
     return PipelineStep(
         technique="pruning",
@@ -206,15 +208,7 @@ def _plan_pruning(section) -> PipelineStep:
 
 def _plan_sparsity(section) -> PipelineStep:
     """Resolve sparsity section to a pipeline step."""
-    config = {
-        "method": section.method,
-        "sparsity": section.sparsity,
-        "pattern": section.pattern,
-    }
-
-    calib = None
-    if section.calibration:
-        calib = section.calibration.model_dump()
+    config, calib, _ = _section_to_config(section)
 
     return PipelineStep(
         technique="sparsity",
@@ -265,26 +259,29 @@ def _plan_auto_quantize(section, resolved: dict) -> PipelineStep:
 
 
 def _plan_distillation(section) -> PipelineStep:
-    """Resolve distillation section to a pipeline step."""
+    """Resolve distillation section to a pipeline step.
+
+    Reshapes section fields into the distill.convert() API format while
+    preserving any extra technique-specific options.
+    """
+    raw, calib, training = _section_to_config(section)
+
+    # Reshape to distill API format
     config: dict[str, Any] = {
-        "teacher_model": section.teacher,
-        "criterion": section.criterion,
+        "teacher_model": raw.pop("teacher"),
+        "criterion": raw.pop("criterion", "kl_div"),
         "loss_balancer": {
             "type": "StaticLossBalancer",
-            "kd_loss_weight": section.kd_loss_weight,
+            "kd_loss_weight": raw.pop("kd_loss_weight", 0.5),
         },
     }
 
-    if section.layer_pairs:
-        config["layer_pairs"] = section.layer_pairs
+    layer_pairs = raw.pop("layer_pairs", None)
+    if layer_pairs:
+        config["layer_pairs"] = layer_pairs
 
-    calib = None
-    if section.calibration:
-        calib = section.calibration.model_dump()
-
-    training = None
-    if section.training:
-        training = section.training.model_dump()
+    # Preserve any extra fields from the section
+    config.update(raw)
 
     return PipelineStep(
         technique="distillation",
