@@ -57,7 +57,7 @@ def test_load_experiment_config(sweep_examples_dir):
     assert config.total_jobs == 12
     assert len(config.eval.tasks) == 4
     assert config.eval.benchmark_set == "lite"
-    assert "codellama/CodeLlama-34b-Instruct" in config.eval.model_overrides
+    assert "Qwen/Qwen3-8B" in config.eval.model_overrides
     assert "lyris_gb200" in config.eval.launcher_overrides
 
 

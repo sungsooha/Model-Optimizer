@@ -27,13 +27,13 @@ from typing import Any
 def recipe_to_hf_ptq_args(resolved: dict[str, Any]) -> dict[str, Any]:
     """Convert load_recipe() output to hf_ptq-compatible config dict.
 
-    load_recipe() returns:
-        {"quantize_config": {"quant_cfg": {...}, "algorithm": "awq_lite"},
-         "calibration": {"dataset": "cnn_dailymail", "num_samples": 512, ...},
-         "export": {"format": "hf", "output_dir": "...", ...}}
+    load_recipe() returns one of:
+        {"quantize_config": {...}, "calibration": {...}, "export": {...}}
+        {"auto_quantize_kwargs": {...}, "calibration": {...}, "export": {...}}
 
-    hf_ptq expects:
-        {"qformat": "fp8", "dataset": "cnn_dailymail", "calib_size": 512, ...}
+    The resolved config is preserved under _resolved_quantize_config or
+    _resolved_auto_quantize_kwargs for direct API use. Calibration and
+    export fields are mapped to hf_ptq CLI-compatible keys.
     """
     hf_ptq: dict[str, Any] = {}
 
@@ -43,6 +43,10 @@ def recipe_to_hf_ptq_args(resolved: dict[str, Any]) -> dict[str, Any]:
         # The resolved config dict is the full mtq.quantize() input.
         # Store it for direct use; also extract qformat for hf_ptq CLI compatibility.
         hf_ptq["_resolved_quantize_config"] = qcfg
+
+    # Map auto_quantize_kwargs → hf_ptq args
+    if "auto_quantize_kwargs" in resolved:
+        hf_ptq["_resolved_auto_quantize_kwargs"] = resolved["auto_quantize_kwargs"]
 
     # Map calibration → hf_ptq args
     if "calibration" in resolved:

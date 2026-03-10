@@ -4,7 +4,7 @@
 # 2 models × 4 recipes × 2 clusters = 16 jobs, each evaluated on 2 tasks.
 #
 # Usage:
-#   .venv/bin/python scripts/demo_big_pareto_sweep.py --config examples/sweeps/sweep_demo.yaml --dry-run
+#   modelopt-recipes dry-run --config examples/recipes/experiments/sweep_demo.yaml
 #
 version: "1.0"
 

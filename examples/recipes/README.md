@@ -88,6 +88,7 @@ pruning → sparsity → quantization → distillation
 ## Python API
 
 ```python
+import modelopt.torch.quantization as mtq
 from modelopt.torch.recipes import load_recipe
 
 # Load and resolve a recipe
@@ -95,6 +96,7 @@ result = load_recipe("examples/recipes/ptq/ptq_fp8.yaml")
 
 # Use the resolved config with ModelOpt
 config = result["quantize_config"]
+# model and calibrate are user-provided (HuggingFace model + calibration loop)
 model = mtq.quantize(model, config, forward_loop=calibrate)
 ```
 

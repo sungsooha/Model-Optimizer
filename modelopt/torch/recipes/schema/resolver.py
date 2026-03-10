@@ -200,7 +200,11 @@ def _resolve_block_sizes(bs: dict[str, Any]) -> dict:
 
 
 def _apply_override(quant_cfg: dict, override: OverrideEntry) -> None:
-    """Apply a single override entry to the quant_cfg dict."""
+    """Apply a single override entry to the quant_cfg dict.
+
+    Pattern overrides merge into existing entries (preserving preset values).
+    Module-class overrides also merge to avoid dropping defaults like disabled BatchNorm.
+    """
     if override.pattern:
         # Start from existing entry if present (to preserve preset values for merging)
         entry: dict[str, Any] = copy.deepcopy(quant_cfg.get(override.pattern, {}))
@@ -209,6 +213,10 @@ def _apply_override(quant_cfg: dict, override: OverrideEntry) -> None:
         if override.format:
             fmt = get_format(override.format)
             entry.update(copy.deepcopy(fmt["weight"]))
+        if override.weights:
+            entry.update(_resolve_single_quantizer(override.weights, "weight"))
+        if override.activations:
+            entry.update(_resolve_single_quantizer(override.activations, "activation"))
         if override.scale_type:
             # Merge scale_type into block_sizes.type, preserving existing block_sizes
             bs = entry.get("block_sizes", {})
@@ -222,7 +230,8 @@ def _apply_override(quant_cfg: dict, override: OverrideEntry) -> None:
         quant_cfg[override.pattern] = entry
 
     elif override.module_class:
-        mc_cfg: dict[str, Any] = {}
+        # Merge into existing entry to preserve defaults (e.g., disabled BatchNorm)
+        mc_cfg: dict[str, Any] = copy.deepcopy(quant_cfg.get(override.module_class, {}))
         if override.weights:
             mc_cfg["*weight_quantizer"] = _resolve_quantizer_spec(override.weights, "weight")
         if override.activations:
@@ -246,5 +255,11 @@ def _resolve_auto_quantize(section: AutoQuantizeSection) -> dict[str, Any]:
 
     if section.disabled_patterns:
         kwargs["disabled_layers"] = section.disabled_patterns
+
+    if section.kv_cache:
+        kv_cfg = copy.deepcopy(get_kv_format(section.kv_cache.format))
+        # Apply KV cache quantization to each candidate format
+        for fmt_cfg in format_configs:
+            _update_quant_cfg_with_kv_cache(fmt_cfg, kv_cfg)
 
     return kwargs

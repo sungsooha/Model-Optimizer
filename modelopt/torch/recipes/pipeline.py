@@ -68,6 +68,7 @@ class PipelinePlan:
 
     recipe_path: str
     steps: list[PipelineStep] = field(default_factory=list)
+    model: dict[str, Any] | None = None
     export: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
 
@@ -77,6 +78,13 @@ class PipelinePlan:
         lines.append("=" * 70)
         lines.append(f"Pipeline Plan: {self.recipe_path}")
         lines.append("=" * 70)
+
+        if self.model:
+            lines.append(f"  Model: {self.model.get('path', '?')}")
+            if self.model.get("trust_remote_code"):
+                lines.append("  trust_remote_code: True")
+            if self.model.get("attn_implementation"):
+                lines.append(f"  attn_implementation: {self.model['attn_implementation']}")
 
         if self.metadata:
             name = self.metadata.get("name", "")
@@ -141,6 +149,9 @@ def plan_pipeline(recipe: RecipeConfig, recipe_path: str = "<inline>") -> Pipeli
     from .schema.resolver import resolve_recipe
 
     plan = PipelinePlan(recipe_path=recipe_path)
+
+    if recipe.model:
+        plan.model = recipe.model.model_dump(exclude_none=True)
 
     if recipe.metadata:
         plan.metadata = recipe.metadata.model_dump(exclude_none=True)

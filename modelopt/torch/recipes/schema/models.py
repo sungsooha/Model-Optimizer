@@ -79,6 +79,13 @@ class OverrideEntry(BaseModel):
     num_bits: int | list[int] | None = None
     axis: int | None = None
 
+    @model_validator(mode="after")
+    def validate_has_selector(self):
+        """Ensure at least one of pattern or module_class is set."""
+        if not self.pattern and not self.module_class:
+            raise ValueError("Override must specify 'pattern' or 'module_class' to target.")
+        return self
+
 
 class QuantizationSection(BaseModel):
     """Quantization technique configuration.
