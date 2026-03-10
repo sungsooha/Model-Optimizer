@@ -35,14 +35,13 @@ from .models import (
 )
 from .presets import get_preset
 
-# Default disabled quantizer patterns — inlined from
-# modelopt.torch.quantization.config._default_disabled_quantizer_cfg
-# to avoid torch dependency at import time.
-_DEFAULT_DISABLED_QUANTIZER_CFG: dict[str, Any] = {
-    "nn.BatchNorm1d": {"*": {"enable": False}},
-    "nn.BatchNorm2d": {"*": {"enable": False}},
-    "nn.BatchNorm3d": {"*": {"enable": False}},
-    "nn.LeakyReLU": {"*": {"enable": False}},
+# Fallback disabled quantizer patterns — used when PR #1000's load_config is not available.
+# Matches PR #1000's configs/ptq/base.yml (torch.nn. prefix, not nn.).
+_FALLBACK_DISABLED_QUANTIZER_CFG: dict[str, Any] = {
+    "torch.nn.BatchNorm1d": {"*": {"enable": False}},
+    "torch.nn.BatchNorm2d": {"*": {"enable": False}},
+    "torch.nn.BatchNorm3d": {"*": {"enable": False}},
+    "torch.nn.LeakyReLU": {"*": {"enable": False}},
     "*lm_head*": {"enable": False},
     "*proj_out.*": {"enable": False},
     "*block_sparse_moe.gate*": {"enable": False},
@@ -57,12 +56,30 @@ _DEFAULT_DISABLED_QUANTIZER_CFG: dict[str, Any] = {
 }
 
 
+def _load_disabled_quantizer_cfg() -> dict[str, Any]:
+    """Load disabled quantizer config: prefer PR #1000's base.yml, fall back to inline."""
+    try:
+        from modelopt.torch.opt.config import load_config  # type: ignore[attr-defined]
+
+        cfg = load_config("configs/ptq/base")
+        return cfg["quant_cfg"]
+    except (ImportError, ModuleNotFoundError, ValueError, KeyError, TypeError):
+        return _FALLBACK_DISABLED_QUANTIZER_CFG
+
+
+_DEFAULT_DISABLED_QUANTIZER_CFG: dict[str, Any] = _load_disabled_quantizer_cfg()
+
+
 def _update_quant_cfg_with_kv_cache(
     quant_cfg: dict[str, Any], kv_cache_quant_cfg: dict[str, Any]
 ) -> dict[str, Any]:
     """Merge KV cache quantizer patterns into the main config.
 
     Equivalent to modelopt.torch.quantization.utils.update_quant_cfg_with_kv_cache_quant().
+
+    Uses dict.update() so the user's explicit kv_cache section in the recipe
+    always wins over any KV patterns baked into the preset (e.g., from Tier 1
+    YAML presets that include kv_quant.yml).
     """
     quant_cfg["quant_cfg"] = quant_cfg.get("quant_cfg", {"default": {"enable": False}})
     quant_cfg["quant_cfg"].update(kv_cache_quant_cfg)
@@ -163,8 +180,7 @@ def _resolve_single_quantizer(spec: QuantizerSpec, target: str) -> dict[str, Any
 
     # Expert-mode overrides
     if spec.num_bits is not None:
-        nb = spec.num_bits
-        result["num_bits"] = tuple(nb) if isinstance(nb, list) else nb
+        result["num_bits"] = spec.num_bits
     if spec.axis is not None:
         result["axis"] = spec.axis
     if spec.block_sizes is not None:
@@ -187,8 +203,8 @@ def _resolve_block_sizes(bs: dict[str, Any]) -> dict:
     for k, v in bs.items():
         if k in key_map:
             result[key_map[k]] = v
-        elif k == "scale_bits" and isinstance(v, list):
-            result["scale_bits"] = tuple(v)
+        elif k == "scale_bits":
+            result["scale_bits"] = v
         else:
             # Pass through: "type", "scale_bits" (tuple), integer keys, etc.
             try:
@@ -223,8 +239,7 @@ def _apply_override(quant_cfg: dict, override: OverrideEntry) -> None:
             bs["type"] = override.scale_type
             entry["block_sizes"] = bs
         if override.num_bits is not None:
-            nb = override.num_bits
-            entry["num_bits"] = tuple(nb) if isinstance(nb, list) else nb
+            entry["num_bits"] = override.num_bits
         if override.axis is not None:
             entry["axis"] = override.axis
         quant_cfg[override.pattern] = entry

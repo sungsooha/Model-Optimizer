@@ -15,26 +15,24 @@
 
 """Preset registry with tiered resolution.
 
-Tier 1 (preferred): Load from modelopt_recipes/ YAML fragments
-    - Uses the YAML fragment library from PR #1000's modelopt_recipes package
-    - Resolves __base__ inheritance and merges fragments into complete configs
-    - Requires modelopt_recipes package installed
+Tier 1a (preferred): Use PR #1000's load_config() when available
+    - Canonical OmegaConf-based __base__ resolution
+    - Forward-compatible: auto-adopts when PR #1000 merges
+    - Falls through gracefully if load_config is not yet available
+
+Tier 1b: Load from modelopt_recipes/ YAML fragments with our own loader
+    - Lightweight __base__ resolution (no OmegaConf dependency)
+    - Used when modelopt_recipes is installed but load_config is not available
 
 Tier 2 (fallback): Live import from modelopt.torch.quantization.config
     - Gets preset dicts from Python constants (deprecated — team removing these)
-    - Requires nvidia-modelopt[torch] installed
-
-Tier 3 (last resort): Bundled snapshot dicts
-    - Hardcoded copies of the preset dicts
-    - Works on Mac without GPU, in CI, in dry-run mode
-    - Must be periodically synced with upstream via scripts/sync_presets.py
+    - Both tiers are in the same repo, so at least one is always available
 """
 
 from __future__ import annotations
 
 import copy
 import logging
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +41,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 _PRESET_REGISTRY: dict[str, dict[str, Any]] | None = None
+_PRESET_METADATA: dict[str, dict[str, str]] = {}
 _PRESET_SOURCE: str = "unknown"
 
 # Mapping from preset name to the composed recipe directory in modelopt_recipes/.
@@ -70,6 +69,7 @@ _PRESET_YAML_MAP: dict[str, str] = {
     "nvfp4_svdquant": "general/ptq/nvfp4_svdquant_default-fp8_kv",
     "nvfp4_mlp_only": "general/ptq/nvfp4_mlp_only-fp8_kv",
     "nvfp4_mlp_wo": "general/ptq/nvfp4_mlp_weight_only-fp8_kv",
+    "nvfp4_omlp_only": "general/ptq/nvfp4_omlp_only-fp8_kv",
     # W4A8 variants
     "w4a8_awq": "general/ptq/w4a8_awq_beta-fp8_kv",
     "w4a8_nvfp4_fp8": "general/ptq/w4a8_nvfp4_fp8-fp8_kv",
@@ -80,11 +80,16 @@ _PRESET_YAML_MAP: dict[str, str] = {
     "mxfp4": "general/ptq/mxfp4_default-fp8_kv",
     "mxint8": "general/ptq/mxint8_default-fp8_kv",
     "mxfp4_mlp_wo": "general/ptq/mxfp4_mlp_weight_only-fp8_kv",
-    # Mamba MOE
+    # Mamba MOE — mamba_moe_fp8_aggressive is Tier-2-only (no YAML directory in PR #1000)
+    "mamba_moe_fp8_aggressive": "general/ptq/mamba_moe_fp8_aggressive-fp8_kv",
     "mamba_moe_fp8_conservative": "general/ptq/mamba_moe_fp8_conservative-fp8_kv",
     "mamba_moe_nvfp4_aggressive": "general/ptq/mamba_moe_nvfp4_aggressive-fp8_kv",
     "mamba_moe_nvfp4_conservative": "general/ptq/mamba_moe_nvfp4_conservative-fp8_kv",
 }
+
+# Presets that only exist as Python constants (no YAML directory in PR #1000).
+# These are skipped during YAML loading and filled from Tier 2 instead.
+_TIER2_ONLY_PRESETS: set[str] = {"mamba_moe_fp8_aggressive"}
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -127,18 +132,16 @@ def _load_yaml_with_bases(yaml_path: Path, recipes_root: Path) -> dict[str, Any]
     return merged
 
 
-def _normalize_yaml_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Normalize YAML-loaded config to match Python constant format.
+def _get_load_config():  # pragma: no cover
+    """Try to import PR #1000's load_config. Returns the function or None."""
+    try:
+        from modelopt.torch.opt.config import load_config  # type: ignore[attr-defined]
 
-    Converts list values (e.g., num_bits: [4, 3]) to tuples to match
-    the format returned by Python *_CFG constants.
-    """
-    if isinstance(config, dict):
-        return {k: _normalize_yaml_config(v) for k, v in config.items()}
-    elif isinstance(config, list):
-        # num_bits and scale_bits are stored as tuples in Python constants
-        return tuple(_normalize_yaml_config(x) for x in config)
-    return config
+        # Verify it actually works (PR #1000 must be merged with YAML fragments)
+        load_config("configs/ptq/base")
+        return load_config
+    except (ImportError, ModuleNotFoundError, ValueError, AttributeError, TypeError):
+        return None
 
 
 def _load_recipe_from_yaml(
@@ -169,14 +172,78 @@ def _load_recipe_from_yaml(
         if "quant_cfg" in kv_config:
             config.setdefault("quant_cfg", {}).update(kv_config["quant_cfg"])
 
-    return _normalize_yaml_config(config)
+    return config
+
+
+def _load_recipe_metadata(
+    recipe_dir: str, recipes_root: Path
+) -> dict[str, str] | None:  # pragma: no cover
+    """Load recipe.yml metadata from a composed recipe directory."""
+    recipe_yml = recipes_root / recipe_dir / "recipe.yml"
+    if not recipe_yml.is_file():
+        return None
+    try:
+        with open(recipe_yml) as f:
+            data = yaml.safe_load(f) or {}
+        return {
+            "description": data.get("description", ""),
+            "recipe_type": data.get("recipe_type", "ptq"),
+        }
+    except (yaml.YAMLError, OSError):
+        return None
+
+
+def _try_load_yaml_registry_via_load_config(
+    load_config_fn,
+) -> dict[str, dict[str, Any]] | None:  # pragma: no cover
+    """Tier 1a: Load presets using PR #1000's load_config (canonical OmegaConf merge)."""
+    registry: dict[str, dict[str, Any]] = {}
+    for preset_name, recipe_dir in _PRESET_YAML_MAP.items():
+        if preset_name in _TIER2_ONLY_PRESETS:
+            continue
+        try:
+            config = load_config_fn(f"{recipe_dir}/model_quant")
+        except (ValueError, FileNotFoundError):
+            logger.debug("load_config failed for preset '%s' — aborting Tier 1a", preset_name)
+            return None
+
+        # Load KV quant if present
+        try:
+            kv_config = load_config_fn(f"{recipe_dir}/kv_quant")
+            if "quant_cfg" in kv_config:
+                config.setdefault("quant_cfg", {}).update(kv_config["quant_cfg"])
+        except (ValueError, FileNotFoundError):
+            pass
+
+        # Load recipe.yml metadata
+        try:
+            meta = load_config_fn(f"{recipe_dir}/recipe")
+            _PRESET_METADATA[preset_name] = {
+                "description": meta.get("description", ""),
+                "recipe_type": meta.get("recipe_type", "ptq"),
+            }
+        except (ValueError, FileNotFoundError):
+            pass
+
+        registry[preset_name] = config
+
+    return registry
 
 
 def _try_load_yaml_registry() -> dict[str, dict[str, Any]] | None:  # pragma: no cover
-    """Attempt to load all presets from modelopt_recipes/ YAML fragments.
+    """Attempt to load presets from YAML fragments.
 
-    Returns the complete registry dict, or None if modelopt_recipes is not available.
+    Tries PR #1000's load_config first (Tier 1a), then our own loader (Tier 1b).
+    Returns the complete registry dict, or None if neither approach works.
     """
+    # Tier 1a: Use PR #1000's load_config (canonical, OmegaConf merge)
+    load_config_fn = _get_load_config()
+    if load_config_fn is not None:
+        registry = _try_load_yaml_registry_via_load_config(load_config_fn)
+        if registry is not None:
+            return registry
+
+    # Tier 1b: Our lightweight YAML loader
     try:
         from importlib.resources import files
 
@@ -184,20 +251,26 @@ def _try_load_yaml_registry() -> dict[str, dict[str, Any]] | None:  # pragma: no
     except (ModuleNotFoundError, TypeError):
         return None
 
-    # Convert Traversable to Path for consistent file operations
-    # importlib.resources.files() may return a Traversable that isn't a Path
     recipes_root = Path(str(recipes_pkg))
     if not recipes_root.is_dir():
         return None
 
-    registry: dict[str, dict[str, Any]] = {}
+    yaml_registry: dict[str, dict[str, Any]] = {}
     for preset_name, recipe_dir in _PRESET_YAML_MAP.items():
+        if preset_name in _TIER2_ONLY_PRESETS:
+            continue
         config = _try_load_single_yaml_preset(preset_name, recipe_dir, recipes_root)
         if config is None:
             return None  # Partial load is worse than no load — fall through to next tier
-        registry[preset_name] = config
 
-    return registry
+        # Load metadata
+        meta = _load_recipe_metadata(recipe_dir, recipes_root)
+        if meta:
+            _PRESET_METADATA[preset_name] = meta
+
+        yaml_registry[preset_name] = config
+
+    return yaml_registry
 
 
 def _try_load_single_yaml_preset(
@@ -209,6 +282,24 @@ def _try_load_single_yaml_preset(
     except (FileNotFoundError, yaml.YAMLError) as exc:
         logger.debug("Failed to load YAML preset '%s': %s", preset_name, exc)
         return None
+
+
+def _fill_tier2_only_presets(registry: dict[str, dict[str, Any]]) -> None:  # pragma: no cover
+    """Load Tier-2-only presets from Python constants."""
+    try:
+        import modelopt.torch.quantization.config as _cfg_mod
+    except (ImportError, ModuleNotFoundError):
+        return
+
+    _tier2_attr_map: dict[str, str] = {
+        "mamba_moe_fp8_aggressive": "MAMBA_MOE_FP8_AGGRESSIVE_CFG",
+    }
+    for name, attr in _tier2_attr_map.items():
+        if name not in registry:
+            try:
+                registry[name] = getattr(_cfg_mod, attr)
+            except AttributeError:
+                logger.debug("Tier-2-only preset '%s' not found as %s", name, attr)
 
 
 def _try_load_python_registry() -> dict[str, dict[str, Any]] | None:  # pragma: no cover
@@ -247,6 +338,7 @@ def _try_load_python_registry() -> dict[str, dict[str, Any]] | None:  # pragma: 
             "nvfp4_svdquant": _cfg_mod.NVFP4_SVDQUANT_DEFAULT_CFG,
             "nvfp4_mlp_only": _cfg_mod.NVFP4_MLP_ONLY_CFG,
             "nvfp4_mlp_wo": _cfg_mod.NVFP4_MLP_WEIGHT_ONLY_CFG,
+            "nvfp4_omlp_only": _cfg_mod.NVFP4_OMLP_ONLY_CFG,
             # W4A8 variants
             "w4a8_awq": _cfg_mod.W4A8_AWQ_BETA_CFG,
             "w4a8_nvfp4_fp8": _cfg_mod.W4A8_NVFP4_FP8_CFG,
@@ -274,12 +366,14 @@ def _load_registry() -> dict[str, dict[str, Any]]:  # pragma: no cover
     if _PRESET_REGISTRY is not None:
         return _PRESET_REGISTRY
 
-    # Tier 1: Load from modelopt_recipes/ YAML fragments (aligned with PR #1000)
+    # Tier 1: Load from YAML fragments (1a: load_config, 1b: our own loader)
     registry = _try_load_yaml_registry()
     if registry is not None:
+        # Fill in Tier-2-only presets from Python constants
+        _fill_tier2_only_presets(registry)
         _PRESET_REGISTRY = registry
         _PRESET_SOURCE = "yaml"
-        logger.debug("Loaded %d presets from modelopt_recipes/ YAML fragments", len(registry))
+        logger.debug("Loaded %d presets from YAML fragments", len(registry))
         return _PRESET_REGISTRY
 
     # Tier 2: Live import from Python constants (deprecated, will be removed)
@@ -290,19 +384,11 @@ def _load_registry() -> dict[str, dict[str, Any]]:  # pragma: no cover
         logger.debug("Loaded %d presets from Python constants (deprecated path)", len(registry))
         return _PRESET_REGISTRY
 
-    # Tier 3: Bundled snapshot
-    from ._bundled_presets import BUNDLED_PRESETS
-
-    warnings.warn(
-        "Neither modelopt_recipes package nor nvidia-modelopt installed. "
-        "Using bundled preset snapshot. Install modelopt_recipes for YAML-based presets, "
-        "or nvidia-modelopt[torch] for live presets.",
-        UserWarning,
-        stacklevel=2,
+    raise RuntimeError(
+        "Cannot load preset registry. Neither modelopt_recipes YAML fragments "
+        "nor modelopt.torch.quantization.config Python constants are available. "
+        "Run 'pip install -e .' from the Model-Optimizer repo root."
     )
-    _PRESET_REGISTRY = BUNDLED_PRESETS
-    _PRESET_SOURCE = "bundled"
-    return _PRESET_REGISTRY
 
 
 def get_preset(name: str) -> dict[str, Any]:
@@ -314,8 +400,18 @@ def get_preset(name: str) -> dict[str, Any]:
     return copy.deepcopy(registry[name])
 
 
+def get_preset_info(name: str) -> dict[str, str]:
+    """Return metadata for a preset (description, recipe_type).
+
+    Metadata is loaded from recipe.yml in the composed recipe directory.
+    Returns empty dict if no metadata is available.
+    """
+    _load_registry()  # Ensure metadata is loaded
+    return _PRESET_METADATA.get(name, {})
+
+
 def get_preset_source() -> str:
-    """Return 'yaml', 'live', or 'bundled' indicating which tier is active."""
+    """Return 'yaml' or 'live' indicating which tier is active."""
     _load_registry()
     return _PRESET_SOURCE
 

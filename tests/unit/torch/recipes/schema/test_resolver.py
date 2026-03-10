@@ -18,7 +18,11 @@
 import yaml
 
 from modelopt.torch.recipes.schema.models import RecipeConfig
-from modelopt.torch.recipes.schema.resolver import _resolve_block_sizes, resolve_recipe
+from modelopt.torch.recipes.schema.resolver import (
+    _resolve_block_sizes,
+    _update_quant_cfg_with_kv_cache,
+    resolve_recipe,
+)
 
 
 def test_custom_weights_activations():
@@ -132,8 +136,8 @@ def test_scale_type_override():
     wq = qcfg["*weight_quantizer"]
     assert wq["block_sizes"]["type"] == "dynamic"
     assert wq["block_sizes"][-1] == 16
-    assert wq["block_sizes"]["scale_bits"] == (4, 3)
-    assert wq["num_bits"] == (2, 1)
+    assert wq["block_sizes"]["scale_bits"] in ([4, 3], (4, 3))
+    assert wq["num_bits"] in ([2, 1], (2, 1))
 
 
 def test_scale_type_new_pattern():
@@ -212,7 +216,7 @@ def test_block_sizes_string_keys():
     result = _resolve_block_sizes({"last_dim": 16, "second_last_dim": 32, "scale_bits": [4, 3]})
     assert result[-1] == 16
     assert result[-2] == 32
-    assert result["scale_bits"] == (4, 3)
+    assert result["scale_bits"] == [4, 3]
 
 
 def test_block_sizes_passthrough():
@@ -220,3 +224,64 @@ def test_block_sizes_passthrough():
     result = _resolve_block_sizes({"type": "dynamic", "0": 128})
     assert result["type"] == "dynamic"
     assert result[0] == 128
+
+
+# ── KV cache deduplication ──
+
+
+def test_kv_cache_user_override_wins():
+    """User's explicit kv_cache section should override preset's baked-in KV patterns.
+
+    Tier 1 YAML presets include KV patterns from kv_quant.yml. When the user
+    specifies a different kv_cache format in the recipe, the user's choice wins.
+    """
+    config = {
+        "quant_cfg": {
+            "*weight_quantizer": {"num_bits": (4, 3)},
+            # Preset has FP8 KV baked in (from Tier 1 YAML)
+            "*[kv]_bmm_quantizer": {"num_bits": (4, 3), "axis": None, "enable": True},
+            "default": {"enable": False},
+        },
+        "algorithm": "max",
+    }
+    # User wants NVFP4 KV instead
+    kv_cfg = {
+        "*[kv]_bmm_quantizer": {"num_bits": (2, 1), "axis": None, "enable": True},
+    }
+    result = _update_quant_cfg_with_kv_cache(config, kv_cfg)
+    # User's NVFP4 choice should override the preset's FP8
+    assert result["quant_cfg"]["*[kv]_bmm_quantizer"]["num_bits"] == (2, 1)
+
+
+def test_kv_cache_merge_adds_missing_patterns():
+    """KV cache merge should add patterns that don't exist yet.
+
+    This is the normal case for Tier 2 presets which don't include KV patterns.
+    """
+    config = {
+        "quant_cfg": {
+            "*weight_quantizer": {"num_bits": (4, 3)},
+            "default": {"enable": False},
+        },
+        "algorithm": "max",
+    }
+    kv_cfg = {
+        "*[kv]_bmm_quantizer": {"num_bits": (4, 3), "axis": None, "enable": True},
+    }
+    result = _update_quant_cfg_with_kv_cache(config, kv_cfg)
+    assert "*[kv]_bmm_quantizer" in result["quant_cfg"]
+    assert result["quant_cfg"]["*[kv]_bmm_quantizer"]["num_bits"] == (4, 3)
+
+
+def test_kv_cache_sets_default_algorithm():
+    """KV cache merge should set algorithm to 'max' if not already set."""
+    config = {"quant_cfg": {"default": {"enable": False}}}
+    result = _update_quant_cfg_with_kv_cache(config, {})
+    assert result["algorithm"] == "max"
+
+
+def test_kv_cache_preserves_existing_algorithm():
+    """KV cache merge should not overwrite an existing algorithm."""
+    config = {"quant_cfg": {"default": {"enable": False}}, "algorithm": "smoothquant"}
+    result = _update_quant_cfg_with_kv_cache(config, {})
+    assert result["algorithm"] == "smoothquant"

@@ -17,7 +17,7 @@
 
 from .formats import FORMAT_REGISTRY, KV_FORMAT_REGISTRY
 from .models import RecipeConfig
-from .presets import get_preset, get_preset_source, list_presets
+from .presets import get_preset, get_preset_info, get_preset_source, list_presets
 from .resolver import resolve_recipe
 
 __all__ = [
@@ -25,6 +25,7 @@ __all__ = [
     "KV_FORMAT_REGISTRY",
     "RecipeConfig",
     "get_preset",
+    "get_preset_info",
     "get_preset_source",
     "list_presets",
     "resolve_recipe",

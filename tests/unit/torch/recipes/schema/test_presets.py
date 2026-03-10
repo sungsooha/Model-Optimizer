@@ -21,14 +21,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from modelopt.torch.recipes.schema._bundled_presets import BUNDLED_PRESETS
 from modelopt.torch.recipes.schema.presets import (
     _PRESET_YAML_MAP,
     _deep_merge,
     _load_recipe_from_yaml,
     _load_yaml_with_bases,
-    _normalize_yaml_config,
     get_preset,
+    get_preset_info,
     get_preset_source,
     list_presets,
 )
@@ -255,26 +254,6 @@ class TestDeepMerge:
         assert result["a"] == {"b": 1, "c": 2}
 
 
-# ── Unit tests: _normalize_yaml_config ──
-
-
-class TestNormalizeConfig:
-    def test_lists_to_tuples(self):
-        config = {"quant_cfg": {"*weight*": {"num_bits": [4, 3]}}}
-        result = _normalize_yaml_config(config)
-        assert result["quant_cfg"]["*weight*"]["num_bits"] == (4, 3)
-
-    def test_nested_lists(self):
-        config = {"block_sizes": {"scale_bits": [4, 3]}}
-        result = _normalize_yaml_config(config)
-        assert result["block_sizes"]["scale_bits"] == (4, 3)
-
-    def test_scalars_unchanged(self):
-        config = {"algorithm": "max", "enable": True, "axis": 0}
-        result = _normalize_yaml_config(config)
-        assert result == config
-
-
 # ── Unit tests: __base__ inheritance ──
 
 
@@ -365,8 +344,8 @@ class TestYamlPresetE2E:
         qcfg = config["quant_cfg"]
         assert qcfg["default"] == {"enable": False}
         assert qcfg["*lm_head*"] == {"enable": False}
-        assert qcfg["*weight_quantizer"]["num_bits"] == (4, 3)
-        assert qcfg["*input_quantizer"]["num_bits"] == (4, 3)
+        assert qcfg["*weight_quantizer"]["num_bits"] == [4, 3]
+        assert qcfg["*input_quantizer"]["num_bits"] == [4, 3]
         assert "*k_proj*input_quantizer" in qcfg
 
     def test_int8_loads_correctly(self, recipes_root):
@@ -387,12 +366,12 @@ class TestYamlPresetE2E:
         assert qcfg["*input_quantizer"] == {"enable": False}
 
     def test_nvfp4_loads_correctly(self, recipes_root):
-        """NVFP4: tuple num_bits (2,1), block_sizes with scale_bits tuple."""
+        """NVFP4: list num_bits [2,1], block_sizes with scale_bits list."""
         config = _load_recipe_from_yaml("general/ptq/nvfp4_default-fp8_kv", recipes_root)
         assert config["algorithm"] == "max"
         wq = config["quant_cfg"]["*weight_quantizer"]
-        assert wq["num_bits"] == (2, 1)
-        assert wq["block_sizes"]["scale_bits"] == (4, 3)
+        assert wq["num_bits"] == [2, 1]
+        assert wq["block_sizes"]["scale_bits"] == [4, 3]
         assert wq["block_sizes"]["type"] == "dynamic"
 
     def test_int8_sq_loads_correctly(self, recipes_root):
@@ -408,27 +387,23 @@ class TestYamlPresetE2E:
         assert "*k_proj*input_quantizer" in qcfg
         assert "*v_proj*input_quantizer" in qcfg
 
-    def test_normalization_converts_lists_to_tuples(self):
-        """_normalize_yaml_config converts all lists to tuples recursively."""
-        raw = {"quant_cfg": {"*wq": {"num_bits": [4, 3], "block_sizes": {"scale_bits": [4, 3]}}}}
-        result = _normalize_yaml_config(raw)
-        assert result["quant_cfg"]["*wq"]["num_bits"] == (4, 3)
-        assert result["quant_cfg"]["*wq"]["block_sizes"]["scale_bits"] == (4, 3)
+    def test_yaml_preserves_lists(self, recipes_root):
+        """YAML-loaded configs preserve lists (no tuple conversion)."""
+        config = _load_recipe_from_yaml("general/ptq/fp8_default-fp8_kv", recipes_root)
+        nb = config["quant_cfg"]["*weight_quantizer"]["num_bits"]
+        assert isinstance(nb, list), f"Expected list, got {type(nb)}"
 
 
 # ── Preset map consistency ──
 
 
 class TestPresetMapConsistency:
-    def test_yaml_map_covers_all_bundled_presets(self):
-        """Every bundled preset should have a corresponding YAML map entry."""
-        missing = set(BUNDLED_PRESETS.keys()) - set(_PRESET_YAML_MAP.keys())
-        assert not missing, f"Bundled presets missing from _PRESET_YAML_MAP: {sorted(missing)}"
-
-    def test_yaml_map_has_no_extra_presets(self):
-        """YAML map should not have presets missing from bundled snapshot."""
-        extra = set(_PRESET_YAML_MAP.keys()) - set(BUNDLED_PRESETS.keys())
-        assert not extra, f"_PRESET_YAML_MAP has presets not in BUNDLED_PRESETS: {sorted(extra)}"
+    def test_yaml_map_covers_all_live_presets(self):
+        """Every live preset should have a corresponding YAML map entry."""
+        live_presets = set(list_presets())
+        yaml_presets = set(_PRESET_YAML_MAP.keys())
+        missing = live_presets - yaml_presets
+        assert not missing, f"Live presets missing from _PRESET_YAML_MAP: {sorted(missing)}"
 
     def test_yaml_map_paths_follow_convention(self):
         """All YAML map paths should follow general/ptq/<name>-fp8_kv pattern."""
@@ -452,10 +427,36 @@ class TestPresetMapConsistency:
 # ── Public API ──
 
 
+class TestYamlKvCacheConsistency:
+    """Verify that YAML-loaded presets produce the same structure as bundled ones."""
+
+    def test_yaml_preset_has_kv_patterns(self, recipes_root):
+        """YAML presets include KV patterns from kv_quant.yml."""
+        config = _load_recipe_from_yaml("general/ptq/fp8_default-fp8_kv", recipes_root)
+        qcfg = config["quant_cfg"]
+        # Should have KV patterns from kv_quant.yml
+        kv_keys = [k for k in qcfg if "k_proj" in k or "v_proj" in k]
+        assert len(kv_keys) > 0, "YAML preset should include KV patterns from kv_quant.yml"
+
+    def test_yaml_preset_no_kv_without_kv_file(self, recipes_root):
+        """YAML preset without kv_quant.yml should NOT have KV patterns."""
+        # Create a preset without kv_quant.yml
+        _setup_preset(
+            recipes_root,
+            "general/ptq/fp8_no_kv",
+            model_quant_bases=["fragments/base", "fragments/fp8_quantizer", "fragments/algo_max"],
+            model_quant_override={},
+        )
+        config = _load_recipe_from_yaml("general/ptq/fp8_no_kv", recipes_root)
+        qcfg = config["quant_cfg"]
+        kv_keys = [k for k in qcfg if "k_proj" in k or "v_proj" in k]
+        assert len(kv_keys) == 0, "Preset without kv_quant.yml should not have KV patterns"
+
+
 class TestPresetAPI:
     def test_source_is_valid(self):
         source = get_preset_source()
-        assert source in ("yaml", "live", "bundled")
+        assert source in ("yaml", "live")
 
     def test_list_presets_nonempty(self):
         presets = list_presets()
@@ -471,3 +472,11 @@ class TestPresetAPI:
     def test_unknown_preset_raises(self):
         with pytest.raises(KeyError, match="Unknown preset"):
             get_preset("nonexistent_preset_xyz")
+
+    def test_get_preset_info_returns_dict(self):
+        info = get_preset_info("fp8")
+        assert isinstance(info, dict)
+
+    def test_nvfp4_omlp_only_in_presets(self):
+        """New PR #1000 preset nvfp4_omlp_only should be in the map."""
+        assert "nvfp4_omlp_only" in _PRESET_YAML_MAP
