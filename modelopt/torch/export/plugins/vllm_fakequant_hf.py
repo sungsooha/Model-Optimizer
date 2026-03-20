@@ -21,6 +21,7 @@ import torch.nn as nn
 
 import modelopt.torch.opt as mto
 from modelopt.torch.export.layer_utils import is_attention, is_quantlinear
+from modelopt.torch.opt.dynamic import DynamicModule
 from modelopt.torch.quantization.nn import QuantModule, TensorQuantizer
 from modelopt.torch.quantization.utils import get_quantizer_state_dict
 
@@ -73,7 +74,8 @@ def export_hf_vllm_fq_checkpoint(
             for attr in ["weight_quantizer", "input_quantizer", "output_quantizer"]:
                 if hasattr(module, attr):
                     delattr(module, attr)
-            module.export()
+            if isinstance(module, DynamicModule):
+                module.export()
         if is_attention(module):
             for attr in [
                 "q_bmm_quantizer",
@@ -83,7 +85,8 @@ def export_hf_vllm_fq_checkpoint(
             ]:
                 if hasattr(module, attr):
                     delattr(module, attr)
-            module.export()
+            if isinstance(module, DynamicModule):
+                module.export()
 
     # Save model
     model.save_pretrained(export_dir, state_dict=model.state_dict(), save_modelopt_state=False)
