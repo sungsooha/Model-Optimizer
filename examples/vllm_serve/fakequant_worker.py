@@ -52,6 +52,12 @@ def _fakequant_run_prolog_worker(self) -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = self.model_runner.model
+    # Unwrap CUDAGraphRunner (or similar wrappers) before modelopt operations.
+    # Without this, restore_from_modelopt_state_vllm → _check_init_modellike →
+    # init_model_from_model_like triggers CUDAGraphRunner.__call__ during init,
+    # which asserts _forward_context is not None (only set during inference).
+    if hasattr(model, "unwrap"):
+        model = model.unwrap()
     if quant_config["modelopt_state_path"]:
         print(f"Loading modelopt state from {quant_config['modelopt_state_path']}")
         # Load on CPU to avoid failures when the checkpoint was saved from a different
