@@ -168,19 +168,98 @@ def _merge_values_require_identical(merged_key: str, key_value_pairs: list[tuple
     """
     Merge values by requiring all values to be identical.
     Used for quantizer state (config/metadata).
+
+    For GQA models, shape-dependent fields (_amax_shape_for_export,
+    _pytorch_state_metadata) may differ across Q/K/V projections because
+    Q has more heads than K/V. These fields are merged by summing the
+    output dimension rather than requiring identical values.
     """
     keys = [k for k, _ in key_value_pairs]
     values = [v for _, v in key_value_pairs]
     first_value = values[0]
 
-    for i, val in enumerate(values[1:], start=1):
-        if not _values_equal(val, first_value):
-            raise ValueError(
-                f"Cannot merge keys into '{merged_key}': values differ.\n"
-                f"  '{keys[0]}' has value: {first_value}\n"
-                f"  '{keys[i]}' has value: {val}"
-            )
-    return first_value
+    # If all values are identical, return early
+    if all(_values_equal(val, first_value) for val in values[1:]):
+        return first_value
+
+    # Values differ — try smart merge for dict metadata (GQA case)
+    if isinstance(first_value, dict):
+        return _smart_merge_metadata(merged_key, keys, values)
+
+    raise ValueError(
+        f"Cannot merge keys into '{merged_key}': values differ.\n"
+        f"  '{keys[0]}' has value: {first_value}\n"
+        f"  '{keys[1]}' has value: {values[1]}"
+    )
+
+
+# Fields whose first element (output dim) should be summed when merging Q/K/V
+_SHAPE_SUM_FIELDS = {"_amax_shape_for_export"}
+
+
+def _smart_merge_metadata(
+    merged_key: str, keys: list[str], values: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Merge quantizer metadata dicts, handling GQA-asymmetric shape fields.
+
+    Most fields must be identical (num_bits, block_sizes, etc.).
+    Shape-dependent fields are merged by summing the output dimension.
+    _pytorch_state_metadata buffer shapes are summed similarly.
+    """
+    merged = {}
+    for field in values[0]:
+        field_values = [v[field] for v in values]
+
+        if field in _SHAPE_SUM_FIELDS:
+            # Sum the output dimension (first element of tuple)
+            # e.g., (4096, -1) + (1024, -1) + (1024, -1) → (6144, -1)
+            first = field_values[0]
+            if isinstance(first, tuple) and len(first) >= 1:
+                summed_dim = sum(fv[0] for fv in field_values)
+                merged[field] = (summed_dim,) + first[1:]
+            else:
+                merged[field] = field_values[0]
+        elif field == "_pytorch_state_metadata":
+            # Merge buffer shapes by summing the first dim
+            merged[field] = _merge_pytorch_state_metadata(field_values)
+        else:
+            # Require identical for all other fields
+            if not all(_values_equal(fv, field_values[0]) for fv in field_values[1:]):
+                raise ValueError(
+                    f"Cannot merge keys into '{merged_key}': "
+                    f"field '{field}' differs across projections.\n"
+                    f"  '{keys[0]}' has {field}: {field_values[0]}\n"
+                    f"  '{keys[1]}' has {field}: {field_values[1]}"
+                )
+            merged[field] = field_values[0]
+
+    return merged
+
+
+def _merge_pytorch_state_metadata(metas: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge _pytorch_state_metadata by summing buffer shape dim 0."""
+    merged = {}
+    for key in metas[0]:
+        vals = [m[key] for m in metas]
+        if key == "buffers" and isinstance(vals[0], dict):
+            merged_buffers = {}
+            for buf_name in vals[0]:
+                buf_vals = [v[buf_name] for v in vals]
+                if isinstance(buf_vals[0], dict) and "shape" in buf_vals[0]:
+                    # Sum first dim of shape, keep rest identical
+                    shapes = [bv["shape"] for bv in buf_vals]
+                    summed_shape = torch.Size(
+                        [sum(s[0] for s in shapes)] + list(shapes[0][1:])
+                    )
+                    merged_buf = dict(buf_vals[0])
+                    merged_buf["shape"] = summed_shape
+                    merged_buffers[buf_name] = merged_buf
+                else:
+                    merged_buffers[buf_name] = buf_vals[0]
+            merged[key] = merged_buffers
+        else:
+            merged[key] = vals[0]
+    return merged
 
 
 def convert_dict_to_vllm(
