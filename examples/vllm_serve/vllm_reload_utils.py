@@ -142,6 +142,10 @@ def _merge_values_by_max_or_concat(merged_key: str, key_value_pairs: list[tuple[
     """
     Merge values by taking max for amax, concatenating for others.
     Used for quantizer state weights (tensor values).
+
+    For GQA models, amax tensors may have different sizes (Q has more heads
+    than K/V). In this case, use torch.cat instead of torch.stack+max, since
+    each amax corresponds to its own weight group in the fused projection.
     """
     values = [value for _, value in key_value_pairs]
 
@@ -151,17 +155,25 @@ def _merge_values_by_max_or_concat(merged_key: str, key_value_pairs: list[tuple[
         for dict_key in values[0]:
             tensors = [v[dict_key] for v in values]
             if "_amax" in dict_key:
-                merged_value[dict_key] = torch.stack(tensors).max(dim=0)[0]
+                merged_value[dict_key] = _merge_amax_tensors(tensors)
             else:
                 merged_value[dict_key] = torch.cat(tensors, dim=0)
         return merged_value
     else:
         # Values are tensors directly
         if "_amax" in merged_key:
-            merged_value = torch.stack(values).max(dim=0)[0]
+            merged_value = _merge_amax_tensors(values)
         else:
             merged_value = torch.cat(values, dim=0)
         return merged_value
+
+
+def _merge_amax_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Merge amax tensors: stack+max if same size (MHA), cat if different (GQA)."""
+    if all(t.shape == tensors[0].shape for t in tensors[1:]):
+        return torch.stack(tensors).max(dim=0)[0]
+    else:
+        return torch.cat(tensors, dim=0)
 
 
 def _merge_values_require_identical(merged_key: str, key_value_pairs: list[tuple[str, Any]]) -> Any:
