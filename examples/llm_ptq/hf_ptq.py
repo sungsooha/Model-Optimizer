@@ -639,7 +639,9 @@ def export_quantized(
             setattr(full_model.config, "architectures", full_model_config.architectures)
 
         start_time = time.time()
-        if (
+        if args.vllm_fakequant_export:
+            export_hf_vllm_fq_checkpoint(full_model, export_dir=export_path)
+        elif (
             model_type in ["t5", "bart", "whisper"]
             or args.sparsity_fmt != "dense"
             or "int8_sq" in args.qformat
@@ -679,21 +681,18 @@ def export_quantized(
 
             # Load any missing weights from non-standard safetensors (handled in get_model for non-low-memory mode)
             # Store the MTP layer prefixes on the model for later exclusion from quantization
-            if args.vllm_fakequant_export:
-                export_hf_vllm_fq_checkpoint(full_model, export_dir=export_path)
-            else:
-                mtp_layer_prefixes, mtp_state_dict = load_mtp_weights(
-                    full_model, args.pyt_ckpt_path
-                )
+            mtp_layer_prefixes, mtp_state_dict = load_mtp_weights(
+                full_model, args.pyt_ckpt_path
+            )
 
-                if mtp_layer_prefixes:
-                    full_model._mtp_layer_prefixes = mtp_layer_prefixes
+            if mtp_layer_prefixes:
+                full_model._mtp_layer_prefixes = mtp_layer_prefixes
 
-                export_hf_checkpoint(
-                    full_model,
-                    export_dir=export_path,
-                    extra_state_dict=mtp_state_dict,
-                )
+            export_hf_checkpoint(
+                full_model,
+                export_dir=export_path,
+                extra_state_dict=mtp_state_dict,
+            )
 
         # Restore default padding and export the tokenizer as well.
         if tokenizer is not None:
