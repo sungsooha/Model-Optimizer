@@ -514,14 +514,14 @@ def set_quantizer_state_dict(model: nn.Module, quantizer_state_dict: dict):
         key = get_unwrapped_name(name, model)
         if isinstance(module, TensorQuantizer) and key in quantizer_state_dict:
             state_dict = quantizer_state_dict[key]
-            # Filter out keys not expected by this quantizer (e.g., _pre_quant_scale
-            # saved from disabled input quantizers during AWQ calibration)
+            # Register any missing buffers before loading (e.g., _pre_quant_scale
+            # set during AWQ calibration on disabled input quantizers — the buffer
+            # is lazily registered, so a fresh quantizer won't have it yet)
             expected_keys = set(module.state_dict().keys())
-            unexpected = set(state_dict.keys()) - expected_keys
-            if unexpected:
-                state_dict = {k: v for k, v in state_dict.items() if k not in unexpected}
-            if state_dict:
-                module.load_state_dict(state_dict)
+            for k, v in state_dict.items():
+                if k not in expected_keys and isinstance(v, torch.Tensor):
+                    module.register_buffer(k, torch.empty_like(v))
+            module.load_state_dict(state_dict)
 
 
 def sync_moe_expert_amax(experts):
