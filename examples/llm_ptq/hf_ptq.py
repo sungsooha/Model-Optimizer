@@ -49,6 +49,7 @@ from transformers import (
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
 import modelopt.torch.sparsity as mts
+from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import (
     export_hf_checkpoint,
     export_hf_vllm_fq_checkpoint,
@@ -900,38 +901,47 @@ def quantize_main(
 
     else:
         # mono quantization
-        assert len(args.qformat.split(",")) == 1, (
-            "Plain quantization supports only one quantization format."
-        )
+        if args.recipe is not None:
+            print(f"Use recipe {args.recipe} for quantization")
+            recipe = load_recipe(args.recipe)
+            assert isinstance(recipe, ModelOptPTQRecipe), (
+                f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}"
+            )
+            quant_cfg = recipe.ptq_cfg
 
-        assert (
-            args.qformat
-            in [
-                "int8_wo",
-                "int4_awq",
-                "fp8",
-                "nvfp4",
-                "nvfp4_awq",
-                "nvfp4_mse",
-                "w4a8_awq",
-                "fp8_pb_wo",
-                "w4a8_mxfp4_fp8",
-                "nvfp4_mlp_only",
-                "nvfp4_omlp_only",
-                "mxfp8",
-            ]
-            or args.kv_cache_qformat in KV_QUANT_CFG_CHOICES
-        ), f"Plain quantization format {args.qformat} not supported for HF export path"
+        else:
+            assert len(args.qformat.split(",")) == 1, (
+                "Plain quantization supports only one quantization format."
+            )
 
-        quant_cfg = build_quant_cfg(
-            args.qformat,
-            args.kv_cache_qformat,
-            args.awq_block_size,
-            model_type,
-            QUANT_CFG_CHOICES,
-            KV_QUANT_CFG_CHOICES,
-            args.moe_calib_experts_ratio,
-        )
+            assert (
+                args.qformat
+                in [
+                    "int8_wo",
+                    "int4_awq",
+                    "fp8",
+                    "nvfp4",
+                    "nvfp4_awq",
+                    "nvfp4_mse",
+                    "w4a8_awq",
+                    "fp8_pb_wo",
+                    "w4a8_mxfp4_fp8",
+                    "nvfp4_mlp_only",
+                    "nvfp4_omlp_only",
+                    "mxfp8",
+                ]
+                or args.kv_cache_qformat in KV_QUANT_CFG_CHOICES
+            ), f"Plain quantization format {args.qformat} not supported for HF export path"
+
+            quant_cfg = build_quant_cfg(
+                args.qformat,
+                args.kv_cache_qformat,
+                args.awq_block_size,
+                model_type,
+                QUANT_CFG_CHOICES,
+                KV_QUANT_CFG_CHOICES,
+                args.moe_calib_experts_ratio,
+            )
 
         # Exclude MTP layers from quantization if detected (e.g., GLM-4.7's layer 92)
         # These layers are typically speculative decoding layers that should be exported as-is
@@ -989,6 +999,13 @@ def parse_args() -> argparse.Namespace:
         "--pyt_ckpt_path",
         help="Specify where the PyTorch checkpoint path is",
         required=True,
+    )
+    parser.add_argument(
+        "--recipe",
+        help=(
+            "PTQ recipe YAML file or name without suffix (e.g. general/ptq/nvfp4_default-fp8_kv)."
+        ),
+        default=None,
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
