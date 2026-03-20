@@ -143,9 +143,10 @@ def _merge_values_by_max_or_concat(merged_key: str, key_value_pairs: list[tuple[
     Merge values by taking max for amax, concatenating for others.
     Used for quantizer state weights (tensor values).
 
-    For GQA models, amax tensors may have different sizes (Q has more heads
-    than K/V). In this case, use torch.cat instead of torch.stack+max, since
-    each amax corresponds to its own weight group in the fused projection.
+    For GQA models, tensors may have different sizes (Q has more heads than K/V).
+    Merge strategy depends on which dimension the tensor operates on:
+    - Output-side tensors (weights, amax): concatenate (different sizes for GQA)
+    - Input-side tensors (_pre_quant_scale): take max (same input dimension)
     """
     values = [value for _, value in key_value_pairs]
 
@@ -154,18 +155,28 @@ def _merge_values_by_max_or_concat(merged_key: str, key_value_pairs: list[tuple[
         merged_value = {}
         for dict_key in values[0]:
             tensors = [v[dict_key] for v in values]
-            if "_amax" in dict_key:
-                merged_value[dict_key] = _merge_amax_tensors(tensors)
-            else:
-                merged_value[dict_key] = torch.cat(tensors, dim=0)
+            merged_value[dict_key] = _merge_qkv_tensors(dict_key, tensors)
         return merged_value
     else:
         # Values are tensors directly
-        if "_amax" in merged_key:
-            merged_value = _merge_amax_tensors(values)
-        else:
-            merged_value = torch.cat(values, dim=0)
-        return merged_value
+        return _merge_qkv_tensors(merged_key, values)
+
+
+# Tensors that operate on the input dimension (shared across Q/K/V).
+# These should be merged with max, not concatenated.
+_INPUT_SIDE_TENSORS = {"_pre_quant_scale"}
+
+
+def _merge_qkv_tensors(key: str, tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Merge Q/K/V tensors with the correct strategy based on tensor type."""
+    # Input-side tensors: same shape across Q/K/V, take element-wise max
+    if any(name in key for name in _INPUT_SIDE_TENSORS):
+        return torch.stack(tensors).max(dim=0)[0]
+    # Amax tensors: stack+max if same size (MHA), cat if different (GQA)
+    if "_amax" in key:
+        return _merge_amax_tensors(tensors)
+    # Output-side tensors (weights etc.): concatenate
+    return torch.cat(tensors, dim=0)
 
 
 def _merge_amax_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
