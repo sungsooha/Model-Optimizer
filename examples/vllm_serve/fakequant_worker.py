@@ -15,6 +15,8 @@
 
 
 import os
+import re
+from collections import defaultdict
 from typing import Any
 
 import torch
@@ -43,89 +45,102 @@ quant_config: dict[str, Any] = {
 }
 
 
-def _dump_quantizer_diagnostics(model) -> None:
-    """Dump quantizer state after fold_weight for debugging AWQ serving bug.
+def _extract_projection_pqs(
+    modelopt_weights: dict[str, Any],
+) -> dict[str, dict[str, torch.Tensor]]:
+    """Extract individual projection _pre_quant_scale values before QKV/gate_up merge.
 
-    Logs layer 0 quantizers in detail plus a summary across all layers.
-    Compare this output with CPU test baselines to identify state corruption.
+    Returns dict mapping layer index to projection pqs:
+        {layer_idx: {'qkv': {'q': tensor, 'k': tensor, 'v': tensor},
+                     'gate_up': {'gate': tensor, 'up': tensor}}}
     """
-    from modelopt.torch.quantization.nn import SequentialQuantizer, TensorQuantizer
+    layer_pqs: dict[int, dict[str, dict[str, torch.Tensor]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
 
-    print("\n" + "=" * 70)
-    print("FAKEQUANT DIAGNOSTIC DUMP (after fold_weight)")
-    print("=" * 70)
-
-    # Per-quantizer stats for layer 0 (detailed)
-    print("\n--- Layer 0 detailed dump ---")
-    for name, module in model.named_modules():
-        if not isinstance(module, TensorQuantizer):
+    for key, value in modelopt_weights.items():
+        if not isinstance(value, dict) or "_pre_quant_scale" not in value:
             continue
-        # Only dump layer 0 in detail
-        if "layers.0." not in name and "layers.0" not in name:
+        # Match q/k/v_proj.input_quantizer
+        qkv_match = re.search(
+            r"layers\.(\d+)\.self_attn\.([qkv])_proj\.input_quantizer$", key
+        )
+        if qkv_match:
+            layer_idx = int(qkv_match.group(1))
+            proj = qkv_match.group(2)
+            layer_pqs[layer_idx]["qkv"][proj] = value["_pre_quant_scale"].clone()
             continue
-        parts = []
-        parts.append(f"disabled={module._disabled}")
-        parts.append(f"fake_quant={module._fake_quant}")
-        parts.append(f"num_bits={module._num_bits}")
-        if hasattr(module, "_amax") and module._amax is not None:
-            a = module._amax
-            parts.append(f"amax={a.item():.6f}" if a.numel() == 1 else
-                         f"amax=[{a.min():.4f},{a.max():.4f}]({a.numel()})")
-            parts.append(f"amax_device={a.device}")
-        if hasattr(module, "_pre_quant_scale") and module._pre_quant_scale is not None:
-            p = module._pre_quant_scale
-            parts.append(f"pqs=[{p.min():.4f},{p.max():.4f}]({p.numel()})")
-            parts.append(f"pqs_device={p.device}")
-        pqs_enabled = getattr(module, "_enable_pre_quant_scale", "N/A")
-        parts.append(f"pqs_enabled={pqs_enabled}")
-        print(f"  {name}: {', '.join(parts)}")
+        # Match gate/up_proj.input_quantizer
+        gate_up_match = re.search(
+            r"layers\.(\d+)\.mlp\.(gate|up)_proj\.input_quantizer$", key
+        )
+        if gate_up_match:
+            layer_idx = int(gate_up_match.group(1))
+            proj = gate_up_match.group(2)
+            layer_pqs[layer_idx]["gate_up"][proj] = value["_pre_quant_scale"].clone()
 
-    # Summary: count quantizer types across all layers
-    print("\n--- Global summary ---")
-    total_tq = 0
-    enabled_input = 0
-    enabled_weight = 0
-    pqs_count = 0
-    pqs_cpu = 0
-    amax_cpu = 0
+    return dict(layer_pqs)
+
+
+def _compensate_awq_pqs_merge(
+    model: torch.nn.Module,
+    layer_pqs: dict[int, dict[str, dict[str, torch.Tensor]]],
+) -> None:
+    """Compensate fused weights for AWQ _pre_quant_scale max-merge mismatch.
+
+    AWQ bakes 1/individual_pqs into each projection's weight during calibration.
+    After QKV/gate_up fusion, merged_pqs = max(proj_pqs...) is applied to the shared
+    input. This creates a per-channel error: merged_pqs/individual_pqs != 1.
+
+    Fix: weight[proj_rows, :] *= individual_pqs / merged_pqs (column-wise correction).
+    """
+    if not layer_pqs:
+        return
+
+    compensated = 0
     for name, module in model.named_modules():
-        if isinstance(module, TensorQuantizer):
-            total_tq += 1
-            if not module._disabled:
-                if "input_quantizer" in name:
-                    enabled_input += 1
-                if "weight_quantizer" in name:
-                    enabled_weight += 1
-            if hasattr(module, "_pre_quant_scale") and module._pre_quant_scale is not None:
-                pqs_count += 1
-                if module._pre_quant_scale.device.type == "cpu":
-                    pqs_cpu += 1
-            if hasattr(module, "_amax") and module._amax is not None:
-                if module._amax.device.type == "cpu":
-                    amax_cpu += 1
+        # Match qkv_proj or gate_up_proj modules
+        layer_match = re.search(r"layers\.(\d+)\.", name)
+        if not layer_match:
+            continue
+        layer_idx = int(layer_match.group(1))
+        if layer_idx not in layer_pqs:
+            continue
+        if not hasattr(module, "weight") or not hasattr(module, "output_partition_sizes"):
+            continue
 
-    print(f"  Total TensorQuantizers: {total_tq}")
-    print(f"  Enabled input_quantizers: {enabled_input}")
-    print(f"  Enabled weight_quantizers: {enabled_weight}")
-    print(f"  Modules with _pre_quant_scale: {pqs_count} (on CPU: {pqs_cpu})")
-    print(f"  Modules with _amax on CPU: {amax_cpu}")
+        if name.endswith(".qkv_proj") and "qkv" in layer_pqs[layer_idx]:
+            pqs = layer_pqs[layer_idx]["qkv"]
+            proj_keys = ["q", "k", "v"]
+        elif name.endswith(".gate_up_proj") and "gate_up" in layer_pqs[layer_idx]:
+            pqs = layer_pqs[layer_idx]["gate_up"]
+            proj_keys = ["gate", "up"]
+        else:
+            continue
 
-    # Smoke test: run one forward through layer 0's first linear
-    print("\n--- Smoke test: layer 0 qkv_proj forward ---")
-    for name, module in model.named_modules():
-        if "layers.0" in name and hasattr(module, "input_quantizer") and hasattr(module, "weight"):
-            try:
-                x = torch.randn(1, module.weight.shape[1], device=module.weight.device,
-                                dtype=module.weight.dtype)
-                x_q = module.input_quantizer(x)
-                y = torch.nn.functional.linear(x_q, module.weight)
-                print(f"  {name}: input={x.shape} → output={y.shape}, "
-                      f"y_mean={y.mean():.4f}, y_std={y.std():.4f}")
-            except Exception as e:
-                print(f"  {name}: FORWARD FAILED — {e}")
-            break
+        if not all(p in pqs for p in proj_keys):
+            continue
 
-    print("=" * 70 + "\n")
+        pqs_tensors = [pqs[p] for p in proj_keys]
+        merged_pqs = torch.stack(pqs_tensors).max(dim=0)[0]
+        partition_sizes = module.output_partition_sizes
+
+        row_start = 0
+        for proj_key, size in zip(proj_keys, partition_sizes):
+            ratio = pqs[proj_key].to(module.weight.device) / merged_pqs.to(
+                module.weight.device
+            )
+            # ratio is [hidden_size], weight is [out_features, hidden_size]
+            # Multiply columns: weight[rows, j] *= ratio[j]
+            module.weight.data[row_start : row_start + size, :] *= ratio
+            row_start += size
+
+        compensated += 1
+
+    if compensated > 0:
+        print(
+            f"AWQ pqs merge compensation applied to {compensated} fused projections"
+        )
 
 
 def _fakequant_run_prolog_worker(self) -> None:
@@ -162,10 +177,15 @@ def _fakequant_run_prolog_worker(self) -> None:
         restore_from_modelopt_state_vllm(model, modelopt_state)
 
         if modelopt_weights is not None:
-            # convert quantizer state values to vllm format
+            # Extract individual projection pqs BEFORE merge (needed for AWQ compensation)
+            projection_pqs = _extract_projection_pqs(modelopt_weights)
+            # convert quantizer state values to vllm format (merges Q/K/V pqs via max)
             modelopt_weights = convert_dict_to_vllm(modelopt_weights, map_fun=map_fun)
             # set quantizer state to model's state_dict
             mtq.utils.set_quantizer_state_dict(model, modelopt_weights)
+            # Compensate fused weights for AWQ pqs max-merge mismatch.
+            # Must happen after state restore (pqs loaded) and before fold_weight.
+            _compensate_awq_pqs_merge(model, projection_pqs)
 
     else:
         if quant_config["quant_file_path"]:
@@ -210,11 +230,6 @@ def _fakequant_run_prolog_worker(self) -> None:
     for name, module in model.named_modules():
         if name.endswith("weight_quantizer"):
             assert not module.is_enabled, f"quantizer {name} is still enabled"
-
-    # Diagnostic dump: log quantizer state after fold_weight for debugging.
-    # Helps identify serving-side state corruption (AWQ garbage output investigation).
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        _dump_quantizer_diagnostics(model)
 
 
 class FakeQuantWorker(BaseWorker):
