@@ -43,6 +43,91 @@ quant_config: dict[str, Any] = {
 }
 
 
+def _dump_quantizer_diagnostics(model) -> None:
+    """Dump quantizer state after fold_weight for debugging AWQ serving bug.
+
+    Logs layer 0 quantizers in detail plus a summary across all layers.
+    Compare this output with CPU test baselines to identify state corruption.
+    """
+    from modelopt.torch.quantization.nn import SequentialQuantizer, TensorQuantizer
+
+    print("\n" + "=" * 70)
+    print("FAKEQUANT DIAGNOSTIC DUMP (after fold_weight)")
+    print("=" * 70)
+
+    # Per-quantizer stats for layer 0 (detailed)
+    print("\n--- Layer 0 detailed dump ---")
+    for name, module in model.named_modules():
+        if not isinstance(module, TensorQuantizer):
+            continue
+        # Only dump layer 0 in detail
+        if "layers.0." not in name and "layers.0" not in name:
+            continue
+        parts = []
+        parts.append(f"disabled={module._disabled}")
+        parts.append(f"fake_quant={module._fake_quant}")
+        parts.append(f"num_bits={module._num_bits}")
+        if hasattr(module, "_amax") and module._amax is not None:
+            a = module._amax
+            parts.append(f"amax={a.item():.6f}" if a.numel() == 1 else
+                         f"amax=[{a.min():.4f},{a.max():.4f}]({a.numel()})")
+            parts.append(f"amax_device={a.device}")
+        if hasattr(module, "_pre_quant_scale") and module._pre_quant_scale is not None:
+            p = module._pre_quant_scale
+            parts.append(f"pqs=[{p.min():.4f},{p.max():.4f}]({p.numel()})")
+            parts.append(f"pqs_device={p.device}")
+        pqs_enabled = getattr(module, "_enable_pre_quant_scale", "N/A")
+        parts.append(f"pqs_enabled={pqs_enabled}")
+        print(f"  {name}: {', '.join(parts)}")
+
+    # Summary: count quantizer types across all layers
+    print("\n--- Global summary ---")
+    total_tq = 0
+    enabled_input = 0
+    enabled_weight = 0
+    pqs_count = 0
+    pqs_cpu = 0
+    amax_cpu = 0
+    for name, module in model.named_modules():
+        if isinstance(module, TensorQuantizer):
+            total_tq += 1
+            if not module._disabled:
+                if "input_quantizer" in name:
+                    enabled_input += 1
+                if "weight_quantizer" in name:
+                    enabled_weight += 1
+            if hasattr(module, "_pre_quant_scale") and module._pre_quant_scale is not None:
+                pqs_count += 1
+                if module._pre_quant_scale.device.type == "cpu":
+                    pqs_cpu += 1
+            if hasattr(module, "_amax") and module._amax is not None:
+                if module._amax.device.type == "cpu":
+                    amax_cpu += 1
+
+    print(f"  Total TensorQuantizers: {total_tq}")
+    print(f"  Enabled input_quantizers: {enabled_input}")
+    print(f"  Enabled weight_quantizers: {enabled_weight}")
+    print(f"  Modules with _pre_quant_scale: {pqs_count} (on CPU: {pqs_cpu})")
+    print(f"  Modules with _amax on CPU: {amax_cpu}")
+
+    # Smoke test: run one forward through layer 0's first linear
+    print("\n--- Smoke test: layer 0 qkv_proj forward ---")
+    for name, module in model.named_modules():
+        if "layers.0" in name and hasattr(module, "input_quantizer") and hasattr(module, "weight"):
+            try:
+                x = torch.randn(1, module.weight.shape[1], device=module.weight.device,
+                                dtype=module.weight.dtype)
+                x_q = module.input_quantizer(x)
+                y = torch.nn.functional.linear(x_q, module.weight)
+                print(f"  {name}: input={x.shape} → output={y.shape}, "
+                      f"y_mean={y.mean():.4f}, y_std={y.std():.4f}")
+            except Exception as e:
+                print(f"  {name}: FORWARD FAILED — {e}")
+            break
+
+    print("=" * 70 + "\n")
+
+
 def _fakequant_run_prolog_worker(self) -> None:
     tokenizer = AutoTokenizer.from_pretrained(
         self.model_runner.model_config.tokenizer,
@@ -125,6 +210,11 @@ def _fakequant_run_prolog_worker(self) -> None:
     for name, module in model.named_modules():
         if name.endswith("weight_quantizer"):
             assert not module.is_enabled, f"quantizer {name} is still enabled"
+
+    # Diagnostic dump: log quantizer state after fold_weight for debugging.
+    # Helps identify serving-side state corruption (AWQ garbage output investigation).
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        _dump_quantizer_diagnostics(model)
 
 
 class FakeQuantWorker(BaseWorker):

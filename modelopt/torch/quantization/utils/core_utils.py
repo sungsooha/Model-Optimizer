@@ -510,17 +510,25 @@ def set_quantizer_state_dict(model: nn.Module, quantizer_state_dict: dict):
     """Set the state dict of the quantizers in the model."""
     from ..nn import TensorQuantizer
 
+    # Determine model device so dynamically registered buffers land on the right device.
+    # The checkpoint may have been loaded on CPU (map_location="cpu"), but the model
+    # parameters are already on CUDA — buffers must match.
+    device = next(model.parameters()).device
+
     for name, module in model.named_modules():
         key = get_unwrapped_name(name, model)
         if isinstance(module, TensorQuantizer) and key in quantizer_state_dict:
             state_dict = quantizer_state_dict[key]
             # Register any missing buffers before loading (e.g., _pre_quant_scale
             # set during AWQ calibration on disabled input quantizers — the buffer
-            # is lazily registered, so a fresh quantizer won't have it yet)
+            # is lazily registered, so a fresh quantizer won't have it yet).
+            # Create on model's device; load_state_dict will copy_() values across devices.
             expected_keys = set(module.state_dict().keys())
             for k, v in state_dict.items():
                 if k not in expected_keys and isinstance(v, torch.Tensor):
-                    module.register_buffer(k, torch.empty_like(v))
+                    module.register_buffer(
+                        k, torch.empty(v.shape, dtype=v.dtype, device=device)
+                    )
             module.load_state_dict(state_dict)
 
 
