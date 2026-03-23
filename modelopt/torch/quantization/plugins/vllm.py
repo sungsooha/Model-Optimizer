@@ -47,9 +47,18 @@ try:
 except ImportError:
     VllmMLAAttention = None
 
+# vllm.attention.Attention was re-exported via __init__.py in <=v0.11.x
+# but removed from __init__.py in v0.12.0; import from explicit path as fallback
+VllmAttention = getattr(vllm_attention, "Attention", None)
+if VllmAttention is None:
+    try:
+        from vllm.attention.layer import Attention as VllmAttention
+    except ImportError:
+        VllmAttention = None
+
 _ATTENTION_TYPES = tuple(
     t
-    for t in [vllm_attention.Attention, CrossAttention, EncoderOnlyAttention, VllmMLAAttention]
+    for t in [VllmAttention, CrossAttention, EncoderOnlyAttention, VllmMLAAttention]
     if t is not None
 )
 
