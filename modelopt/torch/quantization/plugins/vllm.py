@@ -378,7 +378,7 @@ def _vllm_attention_modelopt_post_restore(self, quantizers: list) -> None:
     self.to(device=device, dtype=dtype)
 
 
-@QuantModuleRegistry.register({vllm_attention.Attention: "vllm_Attention"})
+@QuantModuleRegistry.register({VllmAttention: "vllm_Attention"})
 class _QuantVLLMAttention(QuantModule):
     def _setup(self):
         self.q_bmm_quantizer = TensorQuantizer()
