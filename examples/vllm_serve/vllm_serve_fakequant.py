@@ -61,7 +61,12 @@ from vllm.entrypoints.openai.api_server import run_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser
 
 vllm_version = version.parse(vllm.__version__)
-if vllm_version <= version.parse("0.11.0"):
+
+# vLLM v0.12+ (including tpa-separation dev builds) moved to v1 API.
+# Note: dev versions like "0.1.dev14698" parse as < 0.11.0, so we also check
+# for the v1 module path to handle custom builds with non-standard versioning.
+_has_v1_api = hasattr(vllm, "v1") or vllm_version > version.parse("0.11.0")
+if not _has_v1_api:
     from vllm.executor.ray_distributed_executor import RayDistributedExecutor
     from vllm.utils import FlexibleArgumentParser
 else:
@@ -69,7 +74,9 @@ else:
     from vllm.v1.executor.ray_executor import RayDistributedExecutor
 
 
-# Adding the envs you want to pass to the workers
+# Adding the envs you want to pass to the workers.
+# In vLLM v0.12+, ADDITIONAL_ENV_VARS was removed — the new executor copies
+# ALL env vars except WORKER_SPECIFIC_ENV_VARS, so no explicit registration needed.
 additional_env_vars = {
     "QUANT_DATASET",
     "QUANT_CALIB_SIZE",
@@ -80,7 +87,8 @@ additional_env_vars = {
     "CALIB_BATCH_SIZE",
 }
 
-RayDistributedExecutor.ADDITIONAL_ENV_VARS.update(additional_env_vars)
+if hasattr(RayDistributedExecutor, "ADDITIONAL_ENV_VARS"):
+    RayDistributedExecutor.ADDITIONAL_ENV_VARS.update(additional_env_vars)
 
 
 def main():
