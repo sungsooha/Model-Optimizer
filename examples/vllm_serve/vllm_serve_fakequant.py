@@ -62,16 +62,14 @@ from vllm.entrypoints.openai.cli_args import make_arg_parser
 
 vllm_version = version.parse(vllm.__version__)
 
-# vLLM v0.12+ (including tpa-separation dev builds) moved to v1 API.
-# Note: dev versions like "0.1.dev14698" parse as < 0.11.0, so we also check
-# for the v1 module path to handle custom builds with non-standard versioning.
-_has_v1_api = hasattr(vllm, "v1") or vllm_version > version.parse("0.11.0")
-if not _has_v1_api:
-    from vllm.executor.ray_distributed_executor import RayDistributedExecutor
-    from vllm.utils import FlexibleArgumentParser
-else:
+# vLLM v0.12+ (including tpa-separation dev builds) moved FlexibleArgumentParser
+# from vllm.utils to vllm.utils.argparse_utils. Detect by trying the new path first.
+try:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.executor.ray_executor import RayDistributedExecutor
+except (ImportError, ModuleNotFoundError):
+    from vllm.executor.ray_distributed_executor import RayDistributedExecutor
+    from vllm.utils import FlexibleArgumentParser
 
 
 # Adding the envs you want to pass to the workers.
