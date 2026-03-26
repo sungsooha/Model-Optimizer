@@ -175,7 +175,11 @@ def create_parallel_state():
     """Create a parallel state for vLLM."""
     dp_group = get_dp_group().device_group
     tp_group = get_tp_group().device_group
-    ep_group = get_ep_group().device_group
+    try:
+        ep_group = get_ep_group().device_group
+    except (AssertionError, RuntimeError):
+        # EP group is only created for MoE models with num_experts > 0
+        ep_group = None
     return ParallelState(dp_group, tp_group, ep_group)
 
 
