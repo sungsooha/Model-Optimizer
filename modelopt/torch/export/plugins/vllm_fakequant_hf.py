@@ -51,6 +51,10 @@ def export_hf_vllm_fq_checkpoint(
     # Weight quantizers must remain in the model until AFTER state is saved so that
     # the disabled state (_disabled=True) is captured in modelopt_state and
     # quantizer_state_dict. Deletion happens in step 3.
+    # Rotation is also cleared: the weight was already folded with rotation applied,
+    # so if fold_weight is called on reload it must not re-rotate the exported weight.
+    # (Fix from PR #1143)
+    wqs_to_restore = []
     for _, module in model.named_modules():
         if isinstance(module, QuantModule):
             module.fold_weight()
@@ -59,6 +63,10 @@ def export_hf_vllm_fq_checkpoint(
                     wq = getattr(module, attr_name)
                     if isinstance(wq, TensorQuantizer):
                         wq.disable()
+                        orig_rotate = wq._rotate
+                        if hasattr(wq, 'rotate_is_enabled') and wq.rotate_is_enabled:
+                            wq._rotate = False
+                        wqs_to_restore.append((wq, orig_rotate))
 
     # Step 2: Save modelopt state with weight quantizers present but disabled.
     # On reload, _disabled=True is restored via set_from_modelopt_state so weight
@@ -90,3 +98,8 @@ def export_hf_vllm_fq_checkpoint(
 
     # Save model
     model.save_pretrained(export_dir, state_dict=model.state_dict(), save_modelopt_state=False)
+
+    # Restore weight quantizer rotation state (non-mutating export)
+    for wq, orig_rotate in wqs_to_restore:
+        wq.enable()
+        wq._rotate = orig_rotate
