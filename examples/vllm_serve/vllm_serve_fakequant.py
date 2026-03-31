@@ -61,15 +61,20 @@ from vllm.entrypoints.openai.api_server import run_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser
 
 vllm_version = version.parse(vllm.__version__)
-if vllm_version <= version.parse("0.11.0"):
-    from vllm.executor.ray_distributed_executor import RayDistributedExecutor
-    from vllm.utils import FlexibleArgumentParser
-else:
+
+# vLLM v0.12+ (including tpa-separation dev builds) moved FlexibleArgumentParser
+# from vllm.utils to vllm.utils.argparse_utils. Detect by trying the new path first.
+try:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.executor.ray_executor import RayDistributedExecutor
+except (ImportError, ModuleNotFoundError):
+    from vllm.executor.ray_distributed_executor import RayDistributedExecutor
+    from vllm.utils import FlexibleArgumentParser
 
 
-# Adding the envs you want to pass to the workers
+# Adding the envs you want to pass to the workers.
+# In vLLM v0.12+, ADDITIONAL_ENV_VARS was removed — the new executor copies
+# ALL env vars except WORKER_SPECIFIC_ENV_VARS, so no explicit registration needed.
 additional_env_vars = {
     "QUANT_DATASET",
     "QUANT_CALIB_SIZE",
@@ -78,10 +83,10 @@ additional_env_vars = {
     "KV_QUANT_CFG",
     "MODELOPT_STATE_PATH",
     "CALIB_BATCH_SIZE",
-    "TRUST_REMOTE_CODE",
 }
 
-RayDistributedExecutor.ADDITIONAL_ENV_VARS.update(additional_env_vars)
+if hasattr(RayDistributedExecutor, "ADDITIONAL_ENV_VARS"):
+    RayDistributedExecutor.ADDITIONAL_ENV_VARS.update(additional_env_vars)
 
 
 def main():
