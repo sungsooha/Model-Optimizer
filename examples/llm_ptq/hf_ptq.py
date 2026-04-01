@@ -993,7 +993,7 @@ def quantize_main(
             quant_cfg = copy.deepcopy(quant_cfg)
             _set_kv_cache_constant_amax(quant_cfg["quant_cfg"])
 
-        if args.qformat in QUANT_CFG_CHOICES:
+        if args.qformat in QUANT_CFG_CHOICES or args.recipe is not None:
             mono_quantize(
                 args,
                 quant_cfg,
