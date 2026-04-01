@@ -83,6 +83,10 @@ additional_env_vars = {
     "KV_QUANT_CFG",
     "MODELOPT_STATE_PATH",
     "CALIB_BATCH_SIZE",
+    # TurboQuant KV cache quantization
+    "TURBOQUANT_KV_BITS",
+    "TURBOQUANT_KV_OUTLIERS",
+    "TURBOQUANT_KV_PER_HEAD",
 }
 
 if hasattr(RayDistributedExecutor, "ADDITIONAL_ENV_VARS"):
