@@ -14,6 +14,7 @@
 # limitations under the License.
 
 
+import logging
 import os
 import re
 from collections import defaultdict
@@ -32,7 +33,13 @@ from vllm_reload_utils import (
 
 import modelopt.torch.quantization as mtq
 from modelopt.torch.quantization.plugins.vllm import disable_compilation
+from modelopt.torch.quantization.turboquant import (
+    TurboQuantKVHooks,
+    get_turboquant_config,
+)
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
+
+logger = logging.getLogger(__name__)
 
 quant_config: dict[str, Any] = {
     "dataset": os.environ.get("QUANT_DATASET", "cnn_dailymail"),
@@ -248,4 +255,44 @@ class FakeQuantWorker(BaseWorker):
             or quant_config["modelopt_state_path"]
         ):
             _fakequant_run_prolog_worker(self)
+
+        # Apply TurboQuant KV cache hooks after weight quantization
+        self._apply_turboquant_kv_hooks()
+
         super().compile_or_warm_up_model()
+
+    def _apply_turboquant_kv_hooks(self) -> None:
+        """Apply TurboQuant KV cache quantization hooks if configured.
+
+        Reads config from TURBOQUANT_KV_BITS env var. If not set, skips.
+        Must be called after modelopt.restore() so model weights are loaded,
+        but before super().compile_or_warm_up_model() which may compile the model.
+
+        Requires --enforce-eager (CUDA graphs strip forward hooks).
+        """
+        tq_config = get_turboquant_config()
+        if tq_config is None:
+            return
+
+        logger.info(
+            f"TurboQuantKV: Applying {tq_config['bits']}-bit KV cache hooks "
+            f"(outliers={tq_config['outliers']}, per_head={tq_config['per_head']})"
+        )
+
+        model = self.model_runner.model
+        if hasattr(model, "unwrap"):
+            model = model.unwrap()
+        device = next(model.parameters()).device if hasattr(model, 'parameters') else self.device
+
+        self._tq_hooks = TurboQuantKVHooks(
+            model=model,
+            bits=tq_config["bits"],
+            n_outlier=tq_config["outliers"],
+            per_head=tq_config["per_head"],
+            device=device,
+        )
+        n_layers = self._tq_hooks.register()
+        if n_layers == 0:
+            logger.warning("TurboQuantKV: No layers hooked — check model architecture")
+        else:
+            logger.info(f"TurboQuantKV: Successfully hooked {n_layers} attention layers")
