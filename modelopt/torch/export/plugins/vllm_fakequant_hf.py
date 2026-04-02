@@ -224,8 +224,8 @@ def export_hf_vllm_fq_checkpoint(
                     and quantizer.is_enabled
                 ):
                     quantizer.disable()
-                    orig_rotate = quantizer._rotate
-                    if quantizer.rotate_is_enabled:
+                    orig_rotate = getattr(quantizer, "_rotate", None)
+                    if getattr(quantizer, "rotate_is_enabled", False):
                         quantizer._rotate = False
                     wqs_to_restore.append((quantizer, orig_rotate))
 
@@ -264,4 +264,5 @@ def export_hf_vllm_fq_checkpoint(
 
     for wq, orig_rotate in wqs_to_restore:
         wq.enable()
-        wq._rotate = orig_rotate
+        if orig_rotate is not None:
+            wq._rotate = orig_rotate
