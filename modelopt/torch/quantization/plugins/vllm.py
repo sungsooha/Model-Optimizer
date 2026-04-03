@@ -355,7 +355,7 @@ def _get_device_dtype(module: torch.nn.Module, fallback: tuple | None) -> tuple:
     if dev is not None and dt is not None:
         return (dev, _resolve_dtype(dt))
     kv = getattr(module, "kv_cache", None)
-    if kv and kv[0] is not None:
+    if kv is not None and kv[0] is not None:
         d = getattr(module, "kv_cache_dtype", kv[0].dtype)
         return (kv[0].device, kv[0].dtype if d == "auto" else _resolve_dtype(d))
     ref = _get_ref(module)
