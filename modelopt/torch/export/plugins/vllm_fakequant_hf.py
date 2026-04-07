@@ -191,6 +191,62 @@ def _materialize_offloaded_weights(
     logger.info("Materialized %d/%d offloaded weights to CPU", materialized, len(meta_keys))
 
 
+def _post_process_exported_checkpoint(export_dir: Path) -> None:
+    """Strip quantizer artifacts and auto_map from exported checkpoint.
+
+    Handles the case where ``save_pretrained(state_dict=clean_sd)`` is ignored
+    by accelerate for offloaded models, leaking quantizer keys into safetensors
+    and preserving auto_map in config.json.
+    """
+    import json
+
+    # Strip quantizer keys from safetensors shards and index
+    idx_path = export_dir / "model.safetensors.index.json"
+    if idx_path.exists():
+        idx = json.loads(idx_path.read_text())
+        weight_map = idx.get("weight_map", {})
+        quantizer_keys = {k for k in weight_map if "quantizer" in k}
+        if quantizer_keys:
+            # Find which shards contain quantizer keys
+            affected_shards = {weight_map[k] for k in quantizer_keys}
+            logger.info(
+                "Stripping %d quantizer keys from %d shard(s)",
+                len(quantizer_keys),
+                len(affected_shards),
+            )
+            # Re-save affected shards without quantizer keys
+            try:
+                from safetensors.torch import load_file, save_file
+
+                for shard_name in affected_shards:
+                    shard_path = export_dir / shard_name
+                    if not shard_path.exists():
+                        continue
+                    tensors = load_file(str(shard_path))
+                    clean = {k: v for k, v in tensors.items() if "quantizer" not in k}
+                    if clean:
+                        save_file(clean, str(shard_path))
+                    else:
+                        shard_path.unlink()
+                logger.info("Re-saved %d shard(s) without quantizer keys", len(affected_shards))
+            except ImportError:
+                logger.warning("safetensors not available — cannot strip quantizer keys from shards")
+
+            # Update index
+            idx["weight_map"] = {k: v for k, v in weight_map.items() if "quantizer" not in k}
+            idx_path.write_text(json.dumps(idx, indent=2))
+
+    # Strip auto_map from config.json (models with native transformers support
+    # don't need custom code; auto_map references files not present in export)
+    config_path = export_dir / "config.json"
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        if "auto_map" in config:
+            config.pop("auto_map")
+            config_path.write_text(json.dumps(config, indent=2))
+            logger.info("Stripped auto_map from config.json")
+
+
 def export_hf_vllm_fq_checkpoint(
     model: nn.Module,
     export_dir: Path | str,
@@ -344,25 +400,9 @@ def export_hf_vllm_fq_checkpoint(
     model.save_pretrained(export_dir, state_dict=clean_sd, save_modelopt_state=False)
 
     # Step 3b: For accelerate-offloaded models, save_pretrained may ignore
-    # state_dict=clean_sd and save from internal state (including quantizer keys).
-    # Post-process the safetensors index to strip any leaked quantizer keys.
-    idx_path = export_dir / "model.safetensors.index.json"
-    if idx_path.exists():
-        import json
-
-        idx = json.loads(idx_path.read_text())
-        orig_len = len(idx.get("weight_map", {}))
-        idx["weight_map"] = {
-            k: v for k, v in idx.get("weight_map", {}).items() if "quantizer" not in k
-        }
-        stripped = orig_len - len(idx["weight_map"])
-        if stripped > 0:
-            idx_path.write_text(json.dumps(idx, indent=2))
-            logger.info(
-                "Stripped %d quantizer keys from safetensors index "
-                "(accelerate offload workaround)",
-                stripped,
-            )
+    # state_dict=clean_sd and save from internal state (including quantizer keys
+    # and auto_map in config.json). Post-process to strip leaked artifacts.
+    _post_process_exported_checkpoint(export_dir)
 
     for wq, orig_rotate in wqs_to_restore:
         wq.enable()
