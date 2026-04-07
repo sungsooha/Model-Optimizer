@@ -142,9 +142,12 @@ def _merge_values_by_max_or_concat(merged_key: str, key_value_pairs: list[tuple[
     """
     Merge values by taking max for amax, concatenating for others.
     Used for quantizer state weights (tensor values).
+
+    For GQA models, tensors may have different sizes (Q has more heads than K/V).
+    Merge strategy depends on which dimension the tensor operates on:
+    - Output-side tensors (weights, amax): concatenate (different sizes for GQA)
+    - Input-side tensors (_pre_quant_scale): take max (same input dimension)
     """
-    if not key_value_pairs:
-        raise ValueError(f"Cannot merge '{merged_key}': key_value_pairs is empty")
     values = [value for _, value in key_value_pairs]
 
     # Check if values are dicts (OrderedDict) containing tensors
@@ -152,47 +155,134 @@ def _merge_values_by_max_or_concat(merged_key: str, key_value_pairs: list[tuple[
         merged_value = {}
         for dict_key in values[0]:
             tensors = [v[dict_key] for v in values]
-            if "_amax" in dict_key:
-                merged_value[dict_key] = torch.stack(tensors).max(dim=0)[0]
-            elif "_pre_quant_scale" in dict_key:
-                # _pre_quant_scale is per-input-channel: identical across q/k/v projections
-                # since they share the same input. Do not concatenate; take the first value.
-                merged_value[dict_key] = tensors[0]
-            else:
-                merged_value[dict_key] = torch.cat(tensors, dim=0)
+            merged_value[dict_key] = _merge_qkv_tensors(dict_key, tensors)
         return merged_value
     else:
         # Values are tensors directly
-        if "_amax" in merged_key:
-            merged_value = torch.stack(values).max(dim=0)[0]
-        else:
-            merged_value = torch.cat(values, dim=0)
-        return merged_value
+        return _merge_qkv_tensors(merged_key, values)
+
+
+# Tensors that operate on the input dimension (shared across Q/K/V).
+# These should be merged with max, not concatenated.
+_INPUT_SIDE_TENSORS = {"_pre_quant_scale"}
+
+
+def _merge_qkv_tensors(key: str, tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Merge Q/K/V tensors with the correct strategy based on tensor type."""
+    # Input-side tensors: same shape across Q/K/V, take element-wise max
+    if any(name in key for name in _INPUT_SIDE_TENSORS):
+        return torch.stack(tensors).max(dim=0)[0]
+    # Amax tensors: stack+max if same size (MHA), cat if different (GQA)
+    if "_amax" in key:
+        return _merge_amax_tensors(tensors)
+    # Output-side tensors (weights etc.): concatenate
+    return torch.cat(tensors, dim=0)
+
+
+def _merge_amax_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Merge amax tensors: stack+max if same size (MHA), cat if different (GQA)."""
+    if all(t.shape == tensors[0].shape for t in tensors[1:]):
+        return torch.stack(tensors).max(dim=0)[0]
+    else:
+        return torch.cat(tensors, dim=0)
 
 
 def _merge_values_require_identical(merged_key: str, key_value_pairs: list[tuple[str, Any]]) -> Any:
     """
     Merge values by requiring all values to be identical.
     Used for quantizer state (config/metadata).
+
+    For GQA models, shape-dependent fields (_amax_shape_for_export,
+    _pytorch_state_metadata) may differ across Q/K/V projections because
+    Q has more heads than K/V. These fields are merged by summing the
+    output dimension rather than requiring identical values.
     """
     keys = [k for k, _ in key_value_pairs]
     values = [v for _, v in key_value_pairs]
     first_value = values[0]
 
-    # If all quantizers are disabled, their shape-specific fields (e.g. _amax_shape_for_export)
-    # will differ across q/k/v projections even though the config is logically the same.
-    # Since disabled quantizers are not used, skip the equality check.
-    if all(isinstance(v, dict) and v.get("_disabled") for v in values):
+    # If all values are identical, return early
+    if all(_values_equal(val, first_value) for val in values[1:]):
         return first_value
 
-    for i, val in enumerate(values[1:], start=1):
-        if not _values_equal(val, first_value):
-            raise ValueError(
-                f"Cannot merge keys into '{merged_key}': values differ.\n"
-                f"  '{keys[0]}' has value: {first_value}\n"
-                f"  '{keys[i]}' has value: {val}"
-            )
-    return first_value
+    # Values differ — try smart merge for dict metadata (GQA case)
+    if isinstance(first_value, dict):
+        return _smart_merge_metadata(merged_key, keys, values)
+
+    raise ValueError(
+        f"Cannot merge keys into '{merged_key}': values differ.\n"
+        f"  '{keys[0]}' has value: {first_value}\n"
+        f"  '{keys[1]}' has value: {values[1]}"
+    )
+
+
+# Fields whose first element (output dim) should be summed when merging Q/K/V
+_SHAPE_SUM_FIELDS = {"_amax_shape_for_export"}
+
+
+def _smart_merge_metadata(
+    merged_key: str, keys: list[str], values: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Merge quantizer metadata dicts, handling GQA-asymmetric shape fields.
+
+    Most fields must be identical (num_bits, block_sizes, etc.).
+    Shape-dependent fields are merged by summing the output dimension.
+    _pytorch_state_metadata buffer shapes are summed similarly.
+    """
+    merged = {}
+    for field in values[0]:
+        field_values = [v[field] for v in values]
+
+        if field in _SHAPE_SUM_FIELDS:
+            # Sum the output dimension (first element of tuple)
+            # e.g., (4096, -1) + (1024, -1) + (1024, -1) → (6144, -1)
+            first = field_values[0]
+            if isinstance(first, tuple) and len(first) >= 1:
+                summed_dim = sum(fv[0] for fv in field_values)
+                merged[field] = (summed_dim,) + first[1:]
+            else:
+                merged[field] = field_values[0]
+        elif field == "_pytorch_state_metadata":
+            # Merge buffer shapes by summing the first dim
+            merged[field] = _merge_pytorch_state_metadata(field_values)
+        else:
+            # Require identical for all other fields
+            if not all(_values_equal(fv, field_values[0]) for fv in field_values[1:]):
+                raise ValueError(
+                    f"Cannot merge keys into '{merged_key}': "
+                    f"field '{field}' differs across projections.\n"
+                    f"  '{keys[0]}' has {field}: {field_values[0]}\n"
+                    f"  '{keys[1]}' has {field}: {field_values[1]}"
+                )
+            merged[field] = field_values[0]
+
+    return merged
+
+
+def _merge_pytorch_state_metadata(metas: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge _pytorch_state_metadata by summing buffer shape dim 0."""
+    merged = {}
+    for key in metas[0]:
+        vals = [m[key] for m in metas]
+        if key == "buffers" and isinstance(vals[0], dict):
+            merged_buffers = {}
+            for buf_name in vals[0]:
+                buf_vals = [v[buf_name] for v in vals]
+                if isinstance(buf_vals[0], dict) and "shape" in buf_vals[0]:
+                    # Sum first dim of shape, keep rest identical
+                    shapes = [bv["shape"] for bv in buf_vals]
+                    summed_shape = torch.Size(
+                        [sum(s[0] for s in shapes)] + list(shapes[0][1:])
+                    )
+                    merged_buf = dict(buf_vals[0])
+                    merged_buf["shape"] = summed_shape
+                    merged_buffers[buf_name] = merged_buf
+                else:
+                    merged_buffers[buf_name] = buf_vals[0]
+            merged[key] = merged_buffers
+        else:
+            merged[key] = vals[0]
+    return merged
 
 
 def convert_dict_to_vllm(
@@ -221,16 +311,7 @@ def convert_dict_to_vllm(
             # Single key, just rename it
             _, value = key_value_pairs[0]
             vllm_state_dict[merged_key] = value
-    if map_fun is None:
-        return vllm_state_dict
-    # Quantizer module-path keys (e.g. "layers.0.mlp.gate_proj.input_quantizer") must NOT
-    # go through map_fun (hf_to_vllm_mapper.apply_dict), which maps weight tensor paths and
-    # drops any key it doesn't recognise — including all quantizer keys. Split them out,
-    # apply map_fun only to non-quantizer keys, then merge back.
-    quantizer_keys = {k: v for k, v in vllm_state_dict.items() if "_quantizer" in k}
-    non_quantizer_keys = {k: v for k, v in vllm_state_dict.items() if "_quantizer" not in k}
-    mapped = map_fun(non_quantizer_keys) if non_quantizer_keys else {}
-    return {**mapped, **quantizer_keys}
+    return map_fun(vllm_state_dict) if map_fun is not None else vllm_state_dict
 
 
 def convert_modelopt_state_to_vllm(
@@ -242,12 +323,8 @@ def convert_modelopt_state_to_vllm(
 
     This function converts the quantizer state from HuggingFace format to vLLM compatible format.
 
-    Note: modifies modelopt_state in place (pops keys). Callers that need the
-    original dict should pass a copy.
-
     Args:
-        modelopt_state: HuggingFace modelopt state dict (modified in place)
-        map_fun: Optional function to remap non-quantizer keys to vLLM names
+        modelopt_state: HuggingFace modelopt state dict
 
     Returns:
         vLLM compatible modelopt state dict
@@ -302,18 +379,9 @@ def filter_modelopt_state_quantizer_state_for_model(
         metadata = mode_entry[1].get("metadata", {})
         if "quantizer_state" in metadata:
             saved = metadata["quantizer_state"]
-
-            # Keep keys that exist in the model. Remove disabled quantizers UNLESS they
-            # have registered buffers (e.g. _pre_quant_scale from AWQ/smoothquant on a
-            # disabled input_quantizer). Those buffers must reach _reset_pytorch_state_from_metadata
-            # so they get registered before set_quantizer_state_dict loads the values.
-            def _has_buffers(state: dict) -> bool:
-                return bool(state.get("_pytorch_state_metadata", {}).get("buffers"))
-
+            # Keep keys that exist in the model, but remove if quantizer is disabled
             filtered = {
-                k: v
-                for k, v in saved.items()
-                if k in model_keys and (k not in disabled_keys or _has_buffers(v))
+                k: v for k, v in saved.items() if k in model_keys and k not in disabled_keys
             }
             # Add state for quantizers in model but not in metadata (e.g. disabled/excluded)
             for k in model_keys - filtered.keys():

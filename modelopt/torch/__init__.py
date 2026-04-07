@@ -32,13 +32,26 @@ if _Version(_torch_version) < _Version("2.7"):
 try:
     from transformers import __version__ as _transformers_version
 
-    if not (_Version("4.56") <= _Version(_transformers_version) < _Version("5.0")):
+    if not (_Version("4.53") <= _Version(_transformers_version) < _Version("5.0")):
         _warnings.warn(
             f"transformers version {_transformers_version} is not tested with nvidia-modelopt and may cause issues. "
             "Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.",
         )
 except ImportError:
     pass
+else:
+    # Compatibility shim: DynamicCache.get_usable_length was removed in transformers 4.54.0
+    # but many HF model repos (DeepSeek-R1, Kimi-K2) still call it in their modeling code.
+    # Add it back as an alias for get_seq_length so these models work with transformers >= 4.54.
+    try:
+        from transformers import DynamicCache
+
+        if not hasattr(DynamicCache, "get_usable_length") and hasattr(
+            DynamicCache, "get_seq_length"
+        ):
+            DynamicCache.get_usable_length = DynamicCache.get_seq_length
+    except ImportError:
+        pass
 
 # Initialize modelopt_internal if available
 with utils.import_plugin(
