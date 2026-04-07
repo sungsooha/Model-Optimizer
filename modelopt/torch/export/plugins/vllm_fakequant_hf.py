@@ -191,60 +191,58 @@ def _materialize_offloaded_weights(
     logger.info("Materialized %d/%d offloaded weights to CPU", materialized, len(meta_keys))
 
 
-def _post_process_exported_checkpoint(export_dir: Path) -> None:
-    """Strip quantizer artifacts and auto_map from exported checkpoint.
+def _save_clean_checkpoint(
+    model: nn.Module,
+    clean_sd: dict[str, torch.Tensor],
+    export_dir: Path,
+) -> None:
+    """Save clean weights + config directly, bypassing model.save_pretrained().
 
-    Handles the case where ``save_pretrained(state_dict=clean_sd)`` is ignored
-    by accelerate for offloaded models, leaking quantizer keys into safetensors
-    and preserving auto_map in config.json.
+    For accelerate-offloaded models, ``save_pretrained(state_dict=clean_sd)``
+    ignores the provided state_dict and saves from internal state, leaking
+    quantizer keys. This function saves ``clean_sd`` directly via safetensors
+    API, guaranteeing only the intended keys are written.
     """
     import json
 
-    # Strip quantizer keys from safetensors shards and index
-    idx_path = export_dir / "model.safetensors.index.json"
-    if idx_path.exists():
-        idx = json.loads(idx_path.read_text())
-        weight_map = idx.get("weight_map", {})
-        quantizer_keys = {k for k in weight_map if "quantizer" in k}
-        if quantizer_keys:
-            # Find which shards contain quantizer keys
-            affected_shards = {weight_map[k] for k in quantizer_keys}
-            logger.info(
-                "Stripping %d quantizer keys from %d shard(s)",
-                len(quantizer_keys),
-                len(affected_shards),
-            )
-            # Re-save affected shards without quantizer keys
-            try:
-                from safetensors.torch import load_file, save_file
+    from huggingface_hub import split_torch_state_dict_into_shards
+    from safetensors.torch import save_file
 
-                for shard_name in affected_shards:
-                    shard_path = export_dir / shard_name
-                    if not shard_path.exists():
-                        continue
-                    tensors = load_file(str(shard_path))
-                    clean = {k: v for k, v in tensors.items() if "quantizer" not in k}
-                    if clean:
-                        save_file(clean, str(shard_path))
-                    else:
-                        shard_path.unlink()
-                logger.info("Re-saved %d shard(s) without quantizer keys", len(affected_shards))
-            except ImportError:
-                logger.warning("safetensors not available — cannot strip quantizer keys from shards")
+    # Move all tensors to CPU for safetensors (requires uniform device)
+    cpu_sd = {k: v.cpu() if v.device.type != "cpu" else v for k, v in clean_sd.items()}
 
-            # Update index
-            idx["weight_map"] = {k: v for k, v in weight_map.items() if "quantizer" not in k}
-            idx_path.write_text(json.dumps(idx, indent=2))
+    # Shard and save weights
+    state_dict_split = split_torch_state_dict_into_shards(cpu_sd, max_shard_size="5GB")
+    for shard_file, tensor_keys in state_dict_split.filename_to_tensors.items():
+        shard = {k: cpu_sd[k] for k in tensor_keys}
+        save_file(shard, str(export_dir / shard_file))
+        logger.info("Saved shard: %s (%d tensors)", shard_file, len(shard))
 
-    # Strip auto_map from config.json (models with native transformers support
-    # don't need custom code; auto_map references files not present in export)
-    config_path = export_dir / "config.json"
-    if config_path.exists():
-        config = json.loads(config_path.read_text())
-        if "auto_map" in config:
-            config.pop("auto_map")
-            config_path.write_text(json.dumps(config, indent=2))
-            logger.info("Stripped auto_map from config.json")
+    # Write safetensors index (for sharded checkpoints)
+    if state_dict_split.is_sharded:
+        index = {
+            "metadata": state_dict_split.metadata,
+            "weight_map": state_dict_split.tensor_to_filename,
+        }
+        (export_dir / "model.safetensors.index.json").write_text(
+            json.dumps(index, indent=2)
+        )
+
+    # Save config.json (strip auto_map — custom code files not present in export)
+    if hasattr(model, "config"):
+        model.config.save_pretrained(export_dir)
+        config_path = export_dir / "config.json"
+        if config_path.exists():
+            config = json.loads(config_path.read_text())
+            if config.pop("auto_map", None):
+                config_path.write_text(json.dumps(config, indent=2))
+                logger.info("Saved config.json (auto_map stripped)")
+
+    logger.info(
+        "Checkpoint saved: %d weights in %d shard(s)",
+        len(cpu_sd),
+        len(state_dict_split.filename_to_tensors),
+    )
 
 
 def export_hf_vllm_fq_checkpoint(
@@ -396,13 +394,11 @@ def export_hf_vllm_fq_checkpoint(
     modelopt_state["modelopt_state_weights"] = quantizer_state_dict
     torch.save(modelopt_state, export_dir / "vllm_fq_modelopt_state.pth")
 
-    # Step 3: Save HF weights using the pre-built folded state dict.
-    model.save_pretrained(export_dir, state_dict=clean_sd, save_modelopt_state=False)
-
-    # Step 3b: For accelerate-offloaded models, save_pretrained may ignore
-    # state_dict=clean_sd and save from internal state (including quantizer keys
-    # and auto_map in config.json). Post-process to strip leaked artifacts.
-    _post_process_exported_checkpoint(export_dir)
+    # Step 3: Save HF weights directly from clean_sd.
+    # We bypass model.save_pretrained() because accelerate-offloaded models
+    # ignore the state_dict= argument, leaking quantizer keys into safetensors.
+    # Direct save via safetensors API guarantees only clean_sd keys are written.
+    _save_clean_checkpoint(model, clean_sd, export_dir)
 
     for wq, orig_rotate in wqs_to_restore:
         wq.enable()
