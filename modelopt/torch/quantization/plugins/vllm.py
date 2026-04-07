@@ -161,54 +161,9 @@ def _vllm_attr_dtype_to_torch(dtype) -> torch.dtype | None:
     return None
 
 
-def _get_device_dtype(module: torch.nn.Module) -> tuple:
-    """Return ``(device, dtype)`` for a vLLM Attention module, or ``(None, None)`` if unresolvable."""
-    # Explicit attrs set by vLLM at construction — primary path.
-    dev, dt = getattr(module, "device", None), getattr(module, "dtype", None)
-    if dev is not None and dt is not None:
-        dt_resolved = _vllm_attr_dtype_to_torch(dt)
-        if dt_resolved is not None:
-            return dev, dt_resolved
-
-    # KV-cache tensors are available after allocation; respect kv_cache_dtype when set.
-    # kv_cache is a list of tensors (v0) or a single tensor (v1).
-    kv = getattr(module, "kv_cache", None)
-    if kv is not None:
-        t0 = kv[0] if isinstance(kv, (list, tuple)) and len(kv) > 0 else kv
-        if isinstance(t0, torch.Tensor) and t0.numel() > 0:
-            spec = getattr(module, "kv_cache_dtype", t0.dtype)
-            out_dtype = (
-                t0.dtype if spec == "auto" else (_vllm_attr_dtype_to_torch(spec) or t0.dtype)
-            )
-            return t0.device, out_dtype
-
-    # Shallow scan: weights often live on child modules rather than the attention module itself.
-    for mod in (module, *module.children()):
-        for t in chain(mod.parameters(recurse=False), mod.buffers(recurse=False)):
-            return t.device, t.dtype
-
-    return None, None
-
-
-def vllm_replace_quant_module_hook(model: torch.nn.Module) -> None:
-    """Stamp resolved (device, dtype) onto Attention modules before QuantModule replacement."""
-    for _n, m in model.named_modules():
-        if isinstance(m, _ATTENTION_TYPES):
-            m.device, m.dtype = _get_device_dtype(m)
-
-
-CUSTOM_MODEL_PLUGINS.add(vllm_replace_quant_module_hook)
-
-
-def _vllm_attention_modelopt_post_restore(self) -> None:
-    """Move Attention module to its correct device after ModelOpt state restore."""
-    device, dtype = _get_device_dtype(self)
-    if device is None or dtype is None:
-        raise RuntimeError(
-            "Could not determine device/dtype for vLLM Attention. "
-            "Ensure vllm_replace_quant_module_hook runs before replace_quant_module."
-        )
-    self.to(device=device)
+    # NOTE: _get_device_dtype, vllm_replace_quant_module_hook, and
+    # _vllm_attention_modelopt_post_restore are defined below (after FakeQuantMethod)
+    # as they were moved in the upstream quant_cfg refactor.
 
 
 class FakeQuantMethod:
