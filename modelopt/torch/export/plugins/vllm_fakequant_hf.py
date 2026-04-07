@@ -121,7 +121,7 @@ def _process_weight(item: _WeightQuantWork) -> tuple[str, torch.Tensor, str | No
 
 def _process_device_batch(items: list[_WeightQuantWork], device: torch.device):
     """Process all weight items on a single GPU. Runs in a dedicated thread."""
-    with torch.cuda.device(device):
+    with torch.inference_mode(), torch.cuda.device(device):
         results = []
         for item in items:
             results.append(_process_weight(item))
