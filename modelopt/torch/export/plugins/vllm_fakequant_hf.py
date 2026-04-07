@@ -105,6 +105,13 @@ def _process_weight(item: _WeightQuantWork) -> tuple[str, torch.Tensor, str | No
     Returns (sd_key, quantized_weight_on_cpu, inp_q_key_or_None).
     """
     w = item.weight
+    # Quantizer kernels (e.g., fp4_fake_quant_block) require CUDA tensors.
+    # Offloaded weights materialized to CPU need a GPU hop for quantization.
+    if not w.is_cuda:
+        # Quantizers use buffers (amax, etc.) not parameters — check both.
+        qtensors = list(item.quantizer.parameters()) or list(item.quantizer.buffers())
+        if qtensors and qtensors[0].is_cuda:
+            w = w.to(qtensors[0].device)
     w_quant = item.quantizer(w.float()).to(w.dtype).cpu()
     if item.inp_q is not None:
         scale = item.inp_q._pre_quant_scale.squeeze().to(device=w_quant.device)
@@ -129,6 +136,59 @@ def disable_rotate(quantizer: TensorQuantizer):
     if isinstance(quantizer._rotate, dict):  # backward compat: old checkpoints stored a dict
         return dict(quantizer._rotate, enable=False)
     return False
+
+
+def _materialize_offloaded_weights(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    meta_keys: list[str],
+) -> None:
+    """Replace meta tensors in state_dict with actual data from accelerate offload hooks.
+
+    When a model is loaded with ``device_map="auto"`` and some layers are offloaded
+    to CPU or disk, ``model.state_dict()`` returns meta tensors (no data) for those
+    layers. This function walks the model's accelerate hooks to retrieve the actual
+    weight data and updates state_dict in-place.
+    """
+    # Build a map: state_dict key prefix → (module, hook)
+    hook_map: dict[str, tuple] = {}
+    for name, module in model.named_modules():
+        hook = getattr(module, "_hf_hook", None)
+        if hook is None:
+            continue
+        # Walk SequentialHook to find the AlignDevicesHook
+        hooks = [hook]
+        if hasattr(hook, "hooks"):
+            hooks = hook.hooks
+        for h in hooks:
+            if hasattr(h, "weights_map") and h.weights_map is not None:
+                prefix = f"{name}." if name else ""
+                hook_map[prefix] = (module, h)
+                break
+
+    materialized = 0
+    for key in meta_keys:
+        # Find the hook that owns this key
+        for prefix, (module, hook) in hook_map.items():
+            if not key.startswith(prefix):
+                continue
+            local_key = key[len(prefix):]
+            wmap = hook.weights_map
+            # PrefixedDataset wraps the actual state dict
+            if hasattr(wmap, "dataset"):
+                lookup_key = wmap.prefix + local_key
+                actual_sd = wmap.dataset.state_dict
+            else:
+                lookup_key = local_key
+                actual_sd = wmap
+            if lookup_key in actual_sd:
+                state_dict[key] = actual_sd[lookup_key].detach().clone()
+                materialized += 1
+                break
+        else:
+            logger.warning("Could not materialize meta tensor for key: %s", key)
+
+    logger.info("Materialized %d/%d offloaded weights to CPU", materialized, len(meta_keys))
 
 
 def export_hf_vllm_fq_checkpoint(
@@ -159,6 +219,17 @@ def export_hf_vllm_fq_checkpoint(
     # parameters are never modified. Apply each weight quantizer's fake-quant
     # to the corresponding weight tensor in the copy.
     state_dict = model.state_dict()
+
+    # Handle accelerate-offloaded models: state_dict() returns meta tensors
+    # for CPU/disk-offloaded layers. Materialize them from the offload hooks.
+    meta_keys = [k for k, v in state_dict.items() if v.is_meta]
+    if meta_keys:
+        logger.info(
+            "Found %d meta tensors in state_dict (accelerate offloading). "
+            "Materializing from offload hooks...",
+            len(meta_keys),
+        )
+        _materialize_offloaded_weights(model, state_dict, meta_keys)
     fakequant_weights: set[str] = set()
     input_quantizers_folded_pqs: set[str] = set()
 
