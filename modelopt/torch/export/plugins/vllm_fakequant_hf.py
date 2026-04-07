@@ -343,6 +343,27 @@ def export_hf_vllm_fq_checkpoint(
     # Step 3: Save HF weights using the pre-built folded state dict.
     model.save_pretrained(export_dir, state_dict=clean_sd, save_modelopt_state=False)
 
+    # Step 3b: For accelerate-offloaded models, save_pretrained may ignore
+    # state_dict=clean_sd and save from internal state (including quantizer keys).
+    # Post-process the safetensors index to strip any leaked quantizer keys.
+    idx_path = export_dir / "model.safetensors.index.json"
+    if idx_path.exists():
+        import json
+
+        idx = json.loads(idx_path.read_text())
+        orig_len = len(idx.get("weight_map", {}))
+        idx["weight_map"] = {
+            k: v for k, v in idx.get("weight_map", {}).items() if "quantizer" not in k
+        }
+        stripped = orig_len - len(idx["weight_map"])
+        if stripped > 0:
+            idx_path.write_text(json.dumps(idx, indent=2))
+            logger.info(
+                "Stripped %d quantizer keys from safetensors index "
+                "(accelerate offload workaround)",
+                stripped,
+            )
+
     for wq, orig_rotate in wqs_to_restore:
         wq.enable()
         if orig_rotate is not None:
