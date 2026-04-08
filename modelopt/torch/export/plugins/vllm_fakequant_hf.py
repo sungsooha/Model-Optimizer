@@ -20,14 +20,14 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-logger = logging.getLogger(__name__)
-
 import modelopt.torch.opt as mto
 from modelopt.torch.quantization.config import RotateConfig
 from modelopt.torch.quantization.conversion import quantizer_state
 from modelopt.torch.quantization.nn import QuantModule, TensorQuantizer
 from modelopt.torch.quantization.utils import get_quantizer_state_dict
 from modelopt.torch.utils import get_unwrapped_name
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["export_hf_vllm_fq_checkpoint"]
 
@@ -107,7 +107,9 @@ def _save_clean_checkpoint(
     from huggingface_hub import split_torch_state_dict_into_shards
     from safetensors.torch import save_file
 
-    cpu_sd = {k: v.cpu() if v.device.type != "cpu" else v for k, v in clean_sd.items()}
+    # Move to CPU and clone to break shared storage (tied weights like lm_head/embed_tokens).
+    # safetensors rejects tensors that share underlying storage.
+    cpu_sd = {k: v.cpu().clone() for k, v in clean_sd.items()}
 
     state_dict_split = split_torch_state_dict_into_shards(cpu_sd, max_shard_size="5GB")
     for shard_file, tensor_keys in state_dict_split.filename_to_tensors.items():
@@ -203,9 +205,20 @@ def export_hf_vllm_fq_checkpoint(
                     # Quantizer kernels (e.g., fp4_fake_quant_block) require CUDA.
                     # Offloaded weights materialized to CPU need a GPU hop.
                     if not w.is_cuda:
-                        qtensors = list(quantizer.parameters()) or list(quantizer.buffers())
-                        if qtensors and qtensors[0].is_cuda:
-                            w = w.to(qtensors[0].device)
+                        # Find a CUDA device: check quantizer buffers/params first,
+                        # then fall back to sibling tensors on the parent module.
+                        cuda_dev = None
+                        for t in list(quantizer.parameters()) + list(quantizer.buffers()):
+                            if t.is_cuda:
+                                cuda_dev = t.device
+                                break
+                        if cuda_dev is None:
+                            for t in module.parameters():
+                                if t.is_cuda:
+                                    cuda_dev = t.device
+                                    break
+                        if cuda_dev is not None:
+                            w = w.to(cuda_dev)
                     w_quant = quantizer(w.float()).to(w.dtype).cpu()
                     # Fold pre_quant_scale: (x*s)@fake_quant(W) = x@(fake_quant(W)*s)
                     # Only valid when input_quantizer does NOT fake-quant activations. If it does
