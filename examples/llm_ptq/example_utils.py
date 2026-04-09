@@ -783,12 +783,24 @@ def _resolve_model_path(model_name_or_path: str, trust_remote_code: bool = False
     return model_name_or_path
 
 
-def copy_custom_model_files(source_path: str, export_path: str, trust_remote_code: bool = False):
-    """Copy custom model files (configuration_*.py, modeling_*.py, *.json, etc.) from source to export directory.
+def _is_custom_model_type(model_type: str) -> bool:
+    """Check if model_type requires custom code (not natively known by Transformers)."""
+    try:
+        AutoConfig.for_model(model_type)
+        return False
+    except (KeyError, ValueError):
+        return True
 
-    This function copies custom Python files and JSON configuration files that are needed for
-    models with custom code. It excludes config.json and model.safetensors.index.json as these
-    are typically handled separately by the model export process.
+
+def copy_custom_model_files(source_path: str, export_path: str, trust_remote_code: bool = False):
+    """Copy custom model files and preserve auto_map for models Transformers doesn't natively support.
+
+    For custom architectures (nemotron_h, kimi, etc.), copies modeling_*.py, configuration_*.py,
+    and other custom files from source to export directory. Also preserves auto_map in config.json
+    so vLLM can load the checkpoint with trust_remote_code.
+
+    For natively-supported architectures (llama, qwen3, deepseek_v3, etc.), skips copying to
+    avoid conflicts between custom HF modeling files and vLLM's optimized implementations.
 
     Args:
         source_path: Path to the original model directory or HuggingFace model ID
@@ -797,6 +809,17 @@ def copy_custom_model_files(source_path: str, export_path: str, trust_remote_cod
     """
     if not trust_remote_code:
         return
+
+    # Check if this model type needs custom files
+    export_config_path = Path(export_path) / "config.json"
+    if export_config_path.exists():
+        with open(export_config_path) as f:
+            export_cfg = json.load(f)
+        model_type = export_cfg.get("model_type", "")
+        if not _is_custom_model_type(model_type):
+            print(f"Model type '{model_type}' is natively supported by Transformers — skipping custom file copy")
+            return
+        print(f"Model type '{model_type}' requires custom code — copying custom files")
 
     # Resolve the source path (handles both local paths and HF model IDs)
     resolved_source_path = _resolve_model_path(source_path, trust_remote_code)
@@ -844,7 +867,37 @@ def copy_custom_model_files(source_path: str, export_path: str, trust_remote_cod
                 except Exception as e:
                     print(f"Warning: Failed to copy {file_path.name}: {e}")
 
+    # Fallback: check HF_MODULES_CACHE for trust_remote_code downloads
+    hf_modules_cache = os.environ.get("HF_MODULES_CACHE", "/tmp/hf_modules")
+    if Path(hf_modules_cache).exists():
+        for pattern in ["modeling_*.py", "configuration_*.py"]:
+            for file_path in Path(hf_modules_cache).rglob(pattern):
+                if file_path.is_file():
+                    dest_path = export_dir / file_path.name
+                    if not dest_path.exists():
+                        try:
+                            shutil.copy2(file_path, dest_path)
+                            copied_files.append(file_path.name)
+                            print(f"Copied custom model file from HF cache: {file_path.name}")
+                        except Exception as e:
+                            print(f"Warning: Failed to copy {file_path.name}: {e}")
+
     if copied_files:
         print(f"Successfully copied {len(copied_files)} custom model files to {export_path}")
     else:
         print("No custom model files found to copy")
+
+    # Preserve auto_map in config.json for custom architectures
+    if export_config_path.exists():
+        with open(export_config_path) as f:
+            export_cfg = json.load(f)
+        if "auto_map" not in export_cfg:
+            src_config_path = source_dir / "config.json"
+            if src_config_path.exists():
+                with open(src_config_path) as f:
+                    src_cfg = json.load(f)
+                if "auto_map" in src_cfg:
+                    export_cfg["auto_map"] = src_cfg["auto_map"]
+                    with open(export_config_path, "w") as f:
+                        json.dump(export_cfg, f, indent=2)
+                    print(f"Preserved auto_map from source config: {list(src_cfg['auto_map'].keys())}")
