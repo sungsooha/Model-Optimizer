@@ -147,26 +147,24 @@ def get_quant_config(quant_config: dict[str, Any], model: Any) -> dict[str, Any]
         assert isinstance(recipe, ModelOptPTQRecipe), (
             f"Expected PTQ recipe, but got {type(recipe).__name__} from {quant_config['recipe_path']}"
         )
-        quant_cfg = recipe.quantize
-    else:
-        quant_cfg = (
-            copy.deepcopy(getattr(mtq, quant_config["quant_cfg"]))
-            if quant_config["quant_cfg"]
-            else {}
-        )
-        quant_kv_cfg = (
-            copy.deepcopy(getattr(mtq, quant_config["kv_quant_cfg"]))
-            if quant_config["kv_quant_cfg"]
-            else {}
-        )
+        return recipe.quantize
 
-        # Check if model has MLA and update KV config accordingly
-        if quant_kv_cfg:
-            quant_kv_cfg["quant_cfg"] = update_kv_cfg_for_mla(model, quant_kv_cfg["quant_cfg"])
+    quant_cfg = (
+        copy.deepcopy(getattr(mtq, quant_config["quant_cfg"])) if quant_config["quant_cfg"] else {}
+    )
+    quant_kv_cfg = (
+        copy.deepcopy(getattr(mtq, quant_config["kv_quant_cfg"]))
+        if quant_config["kv_quant_cfg"]
+        else {}
+    )
 
-        if quant_kv_cfg:
-            quant_cfg = mtq.utils.update_quant_cfg_with_kv_cache_quant(
-                quant_cfg, quant_kv_cfg["quant_cfg"]
-            )
+    # Check if model has MLA and update KV config accordingly
+    if quant_kv_cfg:
+        quant_kv_cfg["quant_cfg"] = update_kv_cfg_for_mla(model, quant_kv_cfg["quant_cfg"])
+
+    if quant_kv_cfg:
+        quant_cfg = mtq.utils.update_quant_cfg_with_kv_cache_quant(
+            quant_cfg, quant_kv_cfg["quant_cfg"]
+        )
 
     return quant_cfg
