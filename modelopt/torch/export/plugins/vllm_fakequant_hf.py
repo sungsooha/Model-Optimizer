@@ -14,6 +14,11 @@
 # limitations under the License.
 """Export HuggingFace model to vLLM fakequant checkpoint."""
 
+import logging
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -28,6 +33,101 @@ from modelopt.torch.utils import get_unwrapped_name
 
 __all__ = ["export_hf_vllm_fq_checkpoint"]
 
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _WeightQuantWork:
+    """A single weight tensor to be fake-quantized during export."""
+
+    sd_key: str
+    quantizer: TensorQuantizer
+    weight: torch.Tensor
+    # For optional pre_quant_scale folding:
+    inp_q: TensorQuantizer | None
+    inp_q_key: str | None
+
+
+def _collect_quant_work(
+    model: nn.Module, state_dict: dict[str, torch.Tensor]
+) -> list[_WeightQuantWork]:
+    """Collect all weight quantization work items from the model."""
+    work_items = []
+    seen_keys: set[str] = set()
+    for module_name, module in model.named_modules():
+        if not isinstance(module, QuantModule):
+            continue
+        for attr_name, quantizer in module.named_children():
+            if not (
+                attr_name.endswith("weight_quantizer")
+                and isinstance(quantizer, TensorQuantizer)
+                and quantizer.fake_quant
+                and quantizer.is_enabled
+            ):
+                continue
+            weight_name = attr_name.removesuffix("_quantizer")
+            prefix = f"{module_name}." if module_name else ""
+            sd_key = f"{prefix}{weight_name}"
+            assert sd_key not in seen_keys, f"Weight {sd_key} has already been fakequantized"
+            seen_keys.add(sd_key)
+            if sd_key not in state_dict:
+                continue
+            # Check for pre_quant_scale folding eligibility.
+            inp_q = None
+            inp_q_key = None
+            inp_attr = attr_name.replace("weight_quantizer", "input_quantizer")
+            if hasattr(module, inp_attr):
+                candidate = getattr(module, inp_attr)
+                if (
+                    hasattr(candidate, "_pre_quant_scale")
+                    and candidate._pre_quant_scale is not None
+                    and candidate._disabled
+                ):
+                    inp_q = candidate
+                    inp_q_key = get_unwrapped_name(
+                        f"{module_name}.{inp_attr}" if module_name else inp_attr, model
+                    )
+            work_items.append(
+                _WeightQuantWork(
+                    sd_key=sd_key,
+                    quantizer=quantizer,
+                    weight=state_dict[sd_key],
+                    inp_q=inp_q,
+                    inp_q_key=inp_q_key,
+                )
+            )
+    return work_items
+
+
+def _process_weight(item: _WeightQuantWork) -> tuple[str, torch.Tensor, str | None]:
+    """Fake-quantize a single weight tensor and optionally fold pre_quant_scale.
+
+    Returns (sd_key, quantized_weight_on_cpu, inp_q_key_or_None).
+    """
+    w = item.weight
+    # Quantizer kernels (e.g., fp4_fake_quant_block) require CUDA tensors.
+    # Offloaded weights materialized to CPU need a GPU hop for quantization.
+    if not w.is_cuda:
+        # Quantizers use buffers (amax, etc.) not parameters — check both.
+        qtensors = list(item.quantizer.parameters()) or list(item.quantizer.buffers())
+        if qtensors and qtensors[0].is_cuda:
+            w = w.to(qtensors[0].device)
+    w_quant = item.quantizer(w.float()).to(w.dtype).cpu()
+    if item.inp_q is not None:
+        scale = item.inp_q._pre_quant_scale.squeeze().to(device=w_quant.device)
+        w_quant = (w_quant * scale[None, :]).to(w_quant.dtype)
+    return item.sd_key, w_quant, item.inp_q_key
+
+
+def _process_device_batch(items: list[_WeightQuantWork], device: torch.device):
+    """Process all weight items on a single GPU. Runs in a dedicated thread."""
+    with torch.inference_mode(), torch.cuda.device(device):
+        results = []
+        for item in items:
+            results.append(_process_weight(item))
+        torch.cuda.synchronize(device)
+    return results
+
 
 def disable_rotate(quantizer: TensorQuantizer):
     """Return a disabled copy of the quantizer's ``_rotate`` field, preserving its type."""
@@ -38,9 +138,117 @@ def disable_rotate(quantizer: TensorQuantizer):
     return False
 
 
+def _materialize_offloaded_weights(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    meta_keys: list[str],
+) -> None:
+    """Replace meta tensors in state_dict with actual data from accelerate offload hooks.
+
+    When a model is loaded with ``device_map="auto"`` and some layers are offloaded
+    to CPU or disk, ``model.state_dict()`` returns meta tensors (no data) for those
+    layers. This function walks the model's accelerate hooks to retrieve the actual
+    weight data and updates state_dict in-place.
+    """
+    # Build a map: state_dict key prefix → (module, hook)
+    hook_map: dict[str, tuple] = {}
+    for name, module in model.named_modules():
+        hook = getattr(module, "_hf_hook", None)
+        if hook is None:
+            continue
+        # Walk SequentialHook to find the AlignDevicesHook
+        hooks = [hook]
+        if hasattr(hook, "hooks"):
+            hooks = hook.hooks
+        for h in hooks:
+            if hasattr(h, "weights_map") and h.weights_map is not None:
+                prefix = f"{name}." if name else ""
+                hook_map[prefix] = (module, h)
+                break
+
+    materialized = 0
+    for key in meta_keys:
+        # Find the hook that owns this key
+        for prefix, (module, hook) in hook_map.items():
+            if not key.startswith(prefix):
+                continue
+            local_key = key[len(prefix):]
+            wmap = hook.weights_map
+            # PrefixedDataset wraps the actual state dict
+            if hasattr(wmap, "dataset"):
+                lookup_key = wmap.prefix + local_key
+                actual_sd = wmap.dataset.state_dict
+            else:
+                lookup_key = local_key
+                actual_sd = wmap
+            if lookup_key in actual_sd:
+                state_dict[key] = actual_sd[lookup_key].detach().clone()
+                materialized += 1
+                break
+        else:
+            logger.warning("Could not materialize meta tensor for key: %s", key)
+
+    logger.info("Materialized %d/%d offloaded weights to CPU", materialized, len(meta_keys))
+
+
+def _save_clean_checkpoint(
+    model: nn.Module,
+    clean_sd: dict[str, torch.Tensor],
+    export_dir: Path,
+) -> None:
+    """Save clean weights + config directly, bypassing model.save_pretrained().
+
+    For accelerate-offloaded models, ``save_pretrained(state_dict=clean_sd)``
+    ignores the provided state_dict and saves from internal state, leaking
+    quantizer keys. This function saves ``clean_sd`` directly via safetensors
+    API, guaranteeing only the intended keys are written.
+    """
+    import json
+
+    from huggingface_hub import split_torch_state_dict_into_shards
+    from safetensors.torch import save_file
+
+    # Move all tensors to CPU for safetensors (requires uniform device)
+    cpu_sd = {k: v.cpu() if v.device.type != "cpu" else v for k, v in clean_sd.items()}
+
+    # Shard and save weights
+    state_dict_split = split_torch_state_dict_into_shards(cpu_sd, max_shard_size="5GB")
+    for shard_file, tensor_keys in state_dict_split.filename_to_tensors.items():
+        shard = {k: cpu_sd[k] for k in tensor_keys}
+        save_file(shard, str(export_dir / shard_file))
+        logger.info("Saved shard: %s (%d tensors)", shard_file, len(shard))
+
+    # Write safetensors index (for sharded checkpoints)
+    if state_dict_split.is_sharded:
+        index = {
+            "metadata": state_dict_split.metadata,
+            "weight_map": state_dict_split.tensor_to_filename,
+        }
+        (export_dir / "model.safetensors.index.json").write_text(
+            json.dumps(index, indent=2)
+        )
+
+    # Save config.json (strip auto_map — custom code files not present in export)
+    if hasattr(model, "config"):
+        model.config.save_pretrained(export_dir)
+        config_path = export_dir / "config.json"
+        if config_path.exists():
+            config = json.loads(config_path.read_text())
+            if config.pop("auto_map", None):
+                config_path.write_text(json.dumps(config, indent=2))
+                logger.info("Saved config.json (auto_map stripped)")
+
+    logger.info(
+        "Checkpoint saved: %d weights in %d shard(s)",
+        len(cpu_sd),
+        len(state_dict_split.filename_to_tensors),
+    )
+
+
 def export_hf_vllm_fq_checkpoint(
     model: nn.Module,
     export_dir: Path | str,
+    parallel: bool = True,
 ):
     """Export quantized HF weights + ``vllm_fq_modelopt_state.pth`` for vLLM fake-quant reload.
 
@@ -53,6 +261,9 @@ def export_hf_vllm_fq_checkpoint(
     Args:
         model: In-memory quantized model.
         export_dir: Output dir for HF files and ``vllm_fq_modelopt_state.pth``.
+        parallel: If True, fake-quantize weights across GPUs concurrently using
+            one thread per GPU device. Falls back to sequential when all weights
+            are on the same device or on CPU. Default True.
     """
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -62,50 +273,72 @@ def export_hf_vllm_fq_checkpoint(
     # parameters are never modified. Apply each weight quantizer's fake-quant
     # to the corresponding weight tensor in the copy.
     state_dict = model.state_dict()
-    fakequant_weights = set()
-    input_quantizers_folded_pqs = (
-        set()
-    )  # keys for input_quantizers where pre_quant_scale was folded
+
+    # Handle accelerate-offloaded models: state_dict() returns meta tensors
+    # for CPU/disk-offloaded layers. Materialize them from the offload hooks.
+    meta_keys = [k for k, v in state_dict.items() if v.is_meta]
+    if meta_keys:
+        logger.info(
+            "Found %d meta tensors in state_dict (accelerate offloading). "
+            "Materializing from offload hooks...",
+            len(meta_keys),
+        )
+        _materialize_offloaded_weights(model, state_dict, meta_keys)
+    fakequant_weights: set[str] = set()
+    input_quantizers_folded_pqs: set[str] = set()
+
+    work_items = _collect_quant_work(model, state_dict)
+
+    # Group work items by device for parallel dispatch.
+    device_groups: dict[torch.device, list[_WeightQuantWork]] = defaultdict(list)
+    for item in work_items:
+        device_groups[item.weight.device].append(item)
+
+    num_cuda_devices = sum(1 for d in device_groups if d.type == "cuda")
+    use_parallel = parallel and num_cuda_devices > 1
+
+    t0 = time.monotonic()
     with torch.inference_mode():
-        for module_name, module in model.named_modules():
-            if not isinstance(module, QuantModule):
-                continue
-            for attr_name, quantizer in module.named_children():
-                if not (
-                    attr_name.endswith("weight_quantizer")
-                    and isinstance(quantizer, TensorQuantizer)
-                    and quantizer.fake_quant
-                    and quantizer.is_enabled
-                ):
-                    continue
-                weight_name = attr_name.removesuffix("_quantizer")
-                prefix = f"{module_name}." if module_name else ""
-                sd_key = f"{prefix}{weight_name}"
-                assert sd_key not in fakequant_weights, (
-                    f"Weight {sd_key} has already been fakequantized"
-                )
-                if sd_key in state_dict:
-                    w = state_dict[sd_key]
-                    w_quant = quantizer(w.float()).to(w.dtype).cpu()
-                    # Fold pre_quant_scale: (x*s)@fake_quant(W) = x@(fake_quant(W)*s)
-                    # Only valid when input_quantizer does NOT fake-quant activations. If it does
-                    # fake_quant(x*s), the non-linearity prevents folding s into W.
-                    inp_attr = attr_name.replace("weight_quantizer", "input_quantizer")
-                    if hasattr(module, inp_attr):
-                        inp_q = getattr(module, inp_attr)
-                        if (
-                            hasattr(inp_q, "_pre_quant_scale")
-                            and inp_q._pre_quant_scale is not None
-                            and inp_q._disabled
-                        ):
-                            scale = inp_q._pre_quant_scale.squeeze().to(device=w_quant.device)
-                            w_quant = (w_quant * scale[None, :]).to(w_quant.dtype)
-                            inp_q_key = get_unwrapped_name(
-                                f"{module_name}.{inp_attr}" if module_name else inp_attr, model
-                            )
-                            input_quantizers_folded_pqs.add(inp_q_key)
-                    state_dict[sd_key] = w_quant
-                    fakequant_weights.add(sd_key)
+        if use_parallel:
+            logger.info(
+                "Parallel export: %d weights across %d GPUs (%s)",
+                len(work_items),
+                num_cuda_devices,
+                ", ".join(f"{d}: {len(items)} weights" for d, items in device_groups.items()),
+            )
+            all_results: list[tuple[str, torch.Tensor, str | None]] = []
+            with ThreadPoolExecutor(max_workers=num_cuda_devices) as pool:
+                futures = []
+                for device, items in device_groups.items():
+                    if device.type == "cuda":
+                        futures.append(pool.submit(_process_device_batch, items, device))
+                    else:
+                        # CPU weights: process inline (no thread needed).
+                        for item in items:
+                            all_results.append(_process_weight(item))
+                for future in futures:
+                    all_results.extend(future.result())
+            for sd_key, w_quant, inp_q_key in all_results:
+                state_dict[sd_key] = w_quant
+                fakequant_weights.add(sd_key)
+                if inp_q_key is not None:
+                    input_quantizers_folded_pqs.add(inp_q_key)
+        else:
+            # Sequential fallback (single GPU, CPU, or parallel=False).
+            for item in work_items:
+                sd_key, w_quant, inp_q_key = _process_weight(item)
+                state_dict[sd_key] = w_quant
+                fakequant_weights.add(sd_key)
+                if inp_q_key is not None:
+                    input_quantizers_folded_pqs.add(inp_q_key)
+
+    elapsed = time.monotonic() - t0
+    logger.info(
+        "Export step 1 (%s): %d weights fake-quantized in %.1fs",
+        "parallel" if use_parallel else "sequential",
+        len(fakequant_weights),
+        elapsed,
+    )
 
     # Filter quantizer tensors out for a clean HF checkpoint.
     clean_sd = {k: v for k, v in state_dict.items() if "quantizer" not in k}
@@ -126,8 +359,8 @@ def export_hf_vllm_fq_checkpoint(
                     and quantizer.is_enabled
                 ):
                     quantizer.disable()
-                    orig_rotate = quantizer._rotate
-                    if quantizer.rotate_is_enabled:
+                    orig_rotate = getattr(quantizer, "_rotate", None)
+                    if getattr(quantizer, "rotate_is_enabled", False):
                         quantizer._rotate = disable_rotate(quantizer)
                     wqs_to_restore.append((quantizer, orig_rotate))
 
@@ -161,9 +394,13 @@ def export_hf_vllm_fq_checkpoint(
     modelopt_state["modelopt_state_weights"] = quantizer_state_dict
     torch.save(modelopt_state, export_dir / "vllm_fq_modelopt_state.pth")
 
-    # Step 3: Save HF weights using the pre-built folded state dict.
-    model.save_pretrained(export_dir, state_dict=clean_sd, save_modelopt_state=False)
+    # Step 3: Save HF weights directly from clean_sd.
+    # We bypass model.save_pretrained() because accelerate-offloaded models
+    # ignore the state_dict= argument, leaking quantizer keys into safetensors.
+    # Direct save via safetensors API guarantees only clean_sd keys are written.
+    _save_clean_checkpoint(model, clean_sd, export_dir)
 
     for wq, orig_rotate in wqs_to_restore:
         wq.enable()
-        wq._rotate = orig_rotate
+        if orig_rotate is not None:
+            wq._rotate = orig_rotate
