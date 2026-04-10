@@ -111,7 +111,6 @@ QUANT_CFG_CHOICES: dict[str, dict[str, Any]] = {
     "w4a8_nvfp4_fp8": mtq.W4A8_NVFP4_FP8_CFG,
     "w4a8_mxfp4_fp8": mtq.W4A8_MXFP4_FP8_CFG,
     "nvfp4_mlp_only": mtq.NVFP4_MLP_ONLY_CFG,
-    "nvfp4_experts_only": mtq.NVFP4_EXPERTS_ONLY_CFG,
     "nvfp4_omlp_only": mtq.NVFP4_OMLP_ONLY_CFG,
     "nvfp4_svdquant": mtq.NVFP4_SVDQUANT_DEFAULT_CFG,
     "mxfp8": mtq.MXFP8_DEFAULT_CFG,
@@ -326,12 +325,10 @@ def auto_quantize(
             "int4_awq",
             "nvfp4",
             "nvfp4_awq",
-            "nvfp4_mse",
             "w4a8_awq",
             "fp8_pb_wo",
             "w4a8_mxfp4_fp8",
             "nvfp4_mlp_only",
-            "nvfp4_experts_only",
             "nvfp4_omlp_only",
             "mxfp8",
         ]
@@ -485,9 +482,7 @@ def load_model(args: argparse.Namespace):
     elif is_nemotron_vl_model and args.calib_with_images:
         # For Nemotron VL image calibration, we need an AutoProcessor to build multimodal inputs.
         processor = AutoProcessor.from_pretrained(
-            args.pyt_ckpt_path,
-            trust_remote_code=args.trust_remote_code,
-            padding_side="left",
+            args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code, padding_side="left"
         )
 
         if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
@@ -718,7 +713,9 @@ def export_quantized(
             setattr(full_model.config, "architectures", full_model_config.architectures)
 
         start_time = time.time()
-        if (
+        if args.vllm_fakequant_export:
+            export_hf_vllm_fq_checkpoint(full_model, export_dir=export_path)
+        elif (
             model_type in ["t5", "bart", "whisper"]
             or args.sparsity_fmt != "dense"
             or "int8_sq" in args.qformat
@@ -758,21 +755,18 @@ def export_quantized(
 
             # Load any missing weights from non-standard safetensors (handled in get_model for non-low-memory mode)
             # Store the MTP layer prefixes on the model for later exclusion from quantization
-            if args.vllm_fakequant_export:
-                export_hf_vllm_fq_checkpoint(full_model, export_dir=export_path)
-            else:
-                mtp_layer_prefixes, mtp_state_dict = load_mtp_weights(
-                    full_model, args.pyt_ckpt_path
-                )
+            mtp_layer_prefixes, mtp_state_dict = load_mtp_weights(
+                full_model, args.pyt_ckpt_path
+            )
 
-                if mtp_layer_prefixes:
-                    full_model._mtp_layer_prefixes = mtp_layer_prefixes
+            if mtp_layer_prefixes:
+                full_model._mtp_layer_prefixes = mtp_layer_prefixes
 
-                export_hf_checkpoint(
-                    full_model,
-                    export_dir=export_path,
-                    extra_state_dict=mtp_state_dict,
-                )
+            export_hf_checkpoint(
+                full_model,
+                export_dir=export_path,
+                extra_state_dict=mtp_state_dict,
+            )
 
         # Restore default padding and export the tokenizer as well.
         if tokenizer is not None:
@@ -824,11 +818,6 @@ def pre_quantize(
     elif model_type == "deepseek":
         # DeepSeek generation may go OOM, so we skip it
         generated_ids_before_ptq = None
-    elif model_type == "nemotron_h":
-        # NemotronH (SSM/Mamba hybrid) modeling code does not work with accelerate's big model inference
-        # when multiple GPUs are used. So we skip generation for NemotronH models. The issue presents in
-        # the remote code and also in transformers library integration code from v5.3
-        generated_ids_before_ptq = None
     elif is_nemotron_vl_model and tokenizer is not None:
         generated_ids_before_ptq = run_nemotron_vl_preview(
             full_model,
@@ -840,7 +829,9 @@ def pre_quantize(
             trust_remote_code=args.trust_remote_code,
         )
     else:
-        generated_ids_before_ptq = full_model.generate(preview_input_ids, max_new_tokens=100)
+        generated_ids_before_ptq = full_model.generate(
+            preview_input_ids, max_new_tokens=100, do_sample=False
+        )
 
     return preview_input_ids, generated_ids_before_ptq
 
@@ -897,7 +888,9 @@ def post_quantize(
         pass
     elif model_type != "llama4" and not is_nemotron_vl_model:
         # Our fake quantizer may not be fully compatible with torch.compile.
-        generated_ids_after_ptq = full_model.generate(preview_input_ids, max_new_tokens=100)
+        generated_ids_after_ptq = full_model.generate(
+            preview_input_ids, max_new_tokens=100, do_sample=False
+        )
     elif is_nemotron_vl_model and tokenizer is not None:
         generated_ids_after_ptq = run_nemotron_vl_preview(
             full_model,
@@ -1104,7 +1097,7 @@ def quantize_main(
             quant_cfg = copy.deepcopy(quant_cfg)
             _set_kv_cache_constant_amax(quant_cfg["quant_cfg"])
 
-        if args.qformat in QUANT_CFG_CHOICES:
+        if args.qformat in QUANT_CFG_CHOICES or args.recipe is not None:
             mono_quantize(
                 args,
                 quant_cfg,
@@ -1187,6 +1180,13 @@ def parse_args() -> argparse.Namespace:
         default=512,
     )
     parser.add_argument("--export_path", default="exported_model")
+    parser.add_argument(
+        "--vllm_fakequant_export",
+        default=False,
+        action="store_true",
+        help="Export as vLLM fake-quant checkpoint (produces vllm_fq_modelopt_state.pth "
+        "for use with vllm_serve_fakequant.py).",
+    )
     parser.add_argument(
         "--dataset",
         help=(
@@ -1348,13 +1348,6 @@ def parse_args() -> argparse.Namespace:
             "Only used for MOE models; used to reduce the number of experts calibrated during the forward pass. "
             "Does not impact non-MOE models."
         ),
-    )
-    parser.add_argument(
-        "--vllm_fakequant_export",
-        default=False,
-        action="store_true",
-        help="Export as vLLM fake-quant checkpoint (produces vllm_fq_modelopt_state.pth "
-        "for use with vllm_serve_fakequant.py).",
     )
 
     args = parser.parse_args()

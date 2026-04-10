@@ -97,6 +97,7 @@ class QuantModule(DynamicModule):
             2. For sharded modules the restored states of TensorQuantizer could be incorrect. This is because
                 parallelism such as TP might have been changed between saving and resoring. So we need to re-calculate
                 the state shapes. Hence such modules should override this and implement their own logic.
+
         """
         # Get a parameter or buffer that does not belong to a TensorQuantizer
         non_tq_param_or_buffer = None
@@ -134,7 +135,7 @@ class QuantModule(DynamicModule):
             attr = getattr(self, name)
             if (
                 name.endswith("weight_quantizer")
-                and isinstance(attr, TensorQuantizer)
+                and isinstance(attr, (TensorQuantizer, SequentialQuantizer))
                 and attr.fake_quant
             ):
                 # Get the corresponding weight name by removing _weight_quantizer suffix
@@ -151,9 +152,12 @@ class QuantModule(DynamicModule):
                         "_pre_quant_scale",
                         "_amax",
                     ]
-                    for attr_name in _attrs:
-                        if hasattr(attr, attr_name):
-                            delattr(attr, attr_name)
+                    # For SequentialQuantizer, clean up attrs from each child quantizer
+                    quantizers = list(attr) if isinstance(attr, SequentialQuantizer) else [attr]
+                    for q in quantizers:
+                        for attr_name in _attrs:
+                            if hasattr(q, attr_name):
+                                delattr(q, attr_name)
 
 
 QuantModuleRegistry = _DMRegistryCls("Quant", QuantModule)
