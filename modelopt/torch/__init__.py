@@ -43,6 +43,19 @@ try:
         )
 except ImportError:
     pass
+else:
+    # Compatibility shim: DynamicCache.get_usable_length was removed in transformers 4.54.0
+    # but many HF model repos (DeepSeek-R1, Kimi-K2) still call it in their modeling code.
+    # Add it back as an alias for get_seq_length so these models work with transformers >= 4.54.
+    try:
+        from transformers import DynamicCache
+
+        if not hasattr(DynamicCache, "get_usable_length") and hasattr(
+            DynamicCache, "get_seq_length"
+        ):
+            DynamicCache.get_usable_length = DynamicCache.get_seq_length
+    except ImportError:
+        pass
 
 # Initialize modelopt_internal if available
 with utils.import_plugin(

@@ -141,6 +141,14 @@ def update_kv_cfg_for_mla(model: torch.nn.Module, kv_quant_cfg: list) -> list:
 def get_quant_config(quant_config: dict[str, Any], model: Any) -> dict[str, Any]:
     import copy
 
+    if quant_config.get("recipe_path"):
+        from modelopt.recipe import ModelOptPTQRecipe, load_recipe
+        recipe = load_recipe(quant_config["recipe_path"])
+        assert isinstance(recipe, ModelOptPTQRecipe), (
+            f"Expected PTQ recipe, but got {type(recipe).__name__} from {quant_config['recipe_path']}"
+        )
+        return recipe.quantize
+
     quant_cfg = (
         copy.deepcopy(getattr(mtq, quant_config["quant_cfg"])) if quant_config["quant_cfg"] else {}
     )
