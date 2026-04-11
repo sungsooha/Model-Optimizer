@@ -42,6 +42,7 @@ quant_config: dict[str, Any] = {
     "quant_file_path": os.environ.get("QUANT_FILE_PATH", None),
     "modelopt_state_path": os.environ.get("MODELOPT_STATE_PATH", None),
     "calib_batch_size": int(os.environ.get("CALIB_BATCH_SIZE", 1)),
+    "recipe_path": os.environ.get("RECIPE_PATH", None),
 }
 
 
@@ -144,6 +145,7 @@ def _compensate_awq_pqs_merge(
 
 
 def _fakequant_run_prolog_worker(self) -> None:
+    trust_remote_code = os.environ.get("TRUST_REMOTE_CODE", "false").lower() == "true"
     tokenizer = AutoTokenizer.from_pretrained(
         self.model_runner.model_config.tokenizer, trust_remote_code=trust_remote_code
     )
@@ -245,6 +247,7 @@ class FakeQuantWorker(BaseWorker):
             quant_config["quant_cfg"]
             or quant_config["kv_quant_cfg"]
             or quant_config["modelopt_state_path"]
+            or quant_config["recipe_path"]
         ):
             _fakequant_run_prolog_worker(self)
         return super().compile_or_warm_up_model()
