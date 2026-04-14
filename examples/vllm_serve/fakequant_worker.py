@@ -119,7 +119,8 @@ def _fakequant_run_prolog_worker(self) -> None:
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         mtq.print_quant_summary(model)
 
-    mtq.fold_weight(model)
+    # Keep quantizer attrs required by some vLLM runtime paths after folding.
+    mtq.fold_weight(model, keep_attrs=True)
     for name, module in model.named_modules():
         if name.endswith("weight_quantizer"):
             assert not module.is_enabled, f"quantizer {name} is still enabled"
